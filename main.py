@@ -12,6 +12,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from akwam import AkwamClient
+from starcima import StarcimaClient
 
 from bot.cache import TTLCache
 from bot.config import settings
@@ -50,6 +51,7 @@ async def main() -> None:
     log.info("قاعدة البيانات جاهزة: %s", settings.DB_PATH)
 
     akwam = AkwamClient(base_url=settings.AKWAM_DOMAIN)
+    starcima = StarcimaClient(base_url=settings.STARCIMA_DOMAIN)
     cache = TTLCache(ttl_seconds=settings.CACHE_TTL_HOURS * 3600)
     bot = _build_bot()
     downloader = DownloadManager(bot, db, settings.DOWNLOAD_DIR, settings.DEFAULT_MAX_CONCURRENT)
@@ -57,6 +59,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp["db"] = db
     dp["akwam"] = akwam
+    dp["starcima"] = starcima
     dp["cache"] = cache
     dp["downloader"] = downloader
 
@@ -76,6 +79,7 @@ async def main() -> None:
     me = await bot.get_me()
     log.info("البوت اشتغل ✅ @%s (id=%s)", me.username, me.id)
     log.info("دومين أكوام: %s — أدمن: %s", settings.AKWAM_DOMAIN, settings.ADMIN_IDS)
+    log.info("دومين ستار سيما: %s", settings.STARCIMA_DOMAIN)
     if settings.FORCE_CHANNEL:
         log.info("اشتراك إجباري على: %s", settings.FORCE_CHANNEL)
 
@@ -85,6 +89,7 @@ async def main() -> None:
         log.info("بيقفل… إلغاء التحميلات وقفل الاتصالات")
         await downloader.shutdown()
         await akwam.close()
+        await starcima.close()
         await db.close()
         await bot.session.close()
         log.info("اتقفل نضيف 👋")
