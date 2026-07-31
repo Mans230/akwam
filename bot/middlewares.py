@@ -112,7 +112,7 @@ class ApprovalMiddleware(BaseMiddleware):
         return None
 
     async def _notify_admins(self, bot, user: User) -> None:
-        username = f"@{user.username}" if user.username else "—"
+        username = html.escape(f"@{user.username}") if user.username else "—"
         name = html.escape(user.full_name or "—")
         text = (
             "🆕 <b>طلب انضمام جديد</b>\n\n"
@@ -146,7 +146,7 @@ class ForceSubMiddleware(BaseMiddleware):
         if await is_subscribed(bot, self.channel, user.id):
             return await handler(event, data)
         text = (
-            f"🔒 عشان تستخدم البوت لازم تشترك الأول في القناة {self.channel}\n\n"
+            f"🔒 عشان تستخدم البوت لازم تشترك الأول في القناة {html.escape(self.channel)}\n\n"
             "اشترك واضغط «✅ تحققت من الاشتراك»."
         )
         if isinstance(event, CallbackQuery):

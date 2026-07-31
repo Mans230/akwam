@@ -15,6 +15,7 @@ from aiogram.types import FSInputFile, Message, URLInputFile
 
 from .db import Database
 from .keyboards import cancel_kb
+from .textutil import CAPTION_LIMIT, esc as _esc, truncate_html
 
 log = logging.getLogger(__name__)
 
@@ -90,7 +91,7 @@ class DownloadManager:
         if busy >= limit or waiting:
             await self.bot.send_message(
                 chat_id,
-                f"📥 «{job.title}» في طابور الانتظار (رقم {waiting + 1}) — "
+                f"📥 «{_esc(job.title)}» في طابور الانتظار (رقم {waiting + 1}) — "
                 "هيتنفذ لوحده أول ما تحميلك الحالي يخلص.",
             )
         await queue.put(job)
@@ -194,24 +195,24 @@ class DownloadManager:
         try:
             status_msg = await self.bot.send_message(
                 chat_id,
-                f"⏳ بدأ تحميل «{job.title}»…",
+                f"⏳ بدأ تحميل «{_esc(job.title)}»…",
                 reply_markup=cancel_kb(job.task_id),
             )
             segments, premium = await self._segments_for(user_id)
             await self._download_file(job, path, status_msg, segments=segments, premium=premium)
             await self._upload_file(job, path, chat_id, status_msg)
             await self.db.log_download(user_id, job.title, quality, "done")
-            await self._safe_edit(status_msg, f"✅ خلص واتبعت: «{job.title}»")
+            await self._safe_edit(status_msg, f"✅ خلص واتبعت: «{_esc(job.title)}»")
         except asyncio.CancelledError:
             await self.db.log_download(user_id, job.title, quality, "cancelled")
-            await self._safe_edit(status_msg, f"❌ اتلغى تحميل «{job.title}»")
+            await self._safe_edit(status_msg, f"❌ اتلغى تحميل «{_esc(job.title)}»")
             raise
         except Exception as e:  # noqa: BLE001
             log.exception("download failed: %s", job.task_id)
             await self.db.log_download(user_id, job.title, quality, "failed")
             await self._safe_edit(
                 status_msg,
-                f"❌ فشل تحميل «{job.title}»\nالسبب: {type(e).__name__} — جرب تاني.",
+                f"❌ فشل تحميل «{_esc(job.title)}»\nالسبب: {type(e).__name__} — جرب تاني.",
             )
         finally:
             if os.path.exists(path):
@@ -285,7 +286,7 @@ class DownloadManager:
                         total_txt = _fmt_size(total) if total else "غير معروف"
                         await self._safe_edit(
                             status_msg,
-                            f"⬇️ بيتم تحميل «{job.title}»\n"
+                            f"⬇️ بيتم تحميل «{_esc(job.title)}»\n"
                             f"📊 {percent} — 🚀 {speed:.1f} MB/s\n"
                             f"💾 {_fmt_size(downloaded)} / {total_txt}\n"
                             "📥 تحميل عادي",
@@ -416,7 +417,7 @@ class DownloadManager:
             percent = f"{downloaded / total * 100:.0f}%"
             await self._safe_edit(
                 status_msg,
-                f"⬇️ بيتم تحميل «{job.title}»\n"
+                f"⬇️ بيتم تحميل «{_esc(job.title)}»\n"
                 f"📊 {percent} — 🚀 {speed:.1f} MB/s\n"
                 f"💾 {_fmt_size(downloaded)} / {_fmt_size(total)}\n"
                 f"{mode}",
@@ -430,7 +431,7 @@ class DownloadManager:
     ) -> None:
         await self._safe_edit(
             status_msg,
-            f"📤 بيترفع على تليجرام: «{job.title}»\n(ممكن ياخد وقت حسب حجم الملف)",
+            f"📤 بيترفع على تليجرام: «{_esc(job.title)}»\n(ممكن ياخد وقت حسب حجم الملف)",
             with_kb=job.task_id,
         )
         started = time.monotonic()
@@ -444,7 +445,7 @@ class DownloadManager:
                     elapsed = int(time.monotonic() - started)
                     await self._safe_edit(
                         status_msg,
-                        f"📤 بيترفع على تليجرام: «{job.title}»\n⏱ مر {elapsed} ثانية…",
+                        f"📤 بيترفع على تليجرام: «{_esc(job.title)}»\n⏱ مر {elapsed} ثانية…",
                         with_kb=job.task_id,
                     )
 
@@ -454,7 +455,7 @@ class DownloadManager:
             await self.bot.send_video(
                 chat_id,
                 FSInputFile(path),
-                caption=job.caption,
+                caption=truncate_html(job.caption, CAPTION_LIMIT),
                 supports_streaming=True,
                 thumbnail=thumbnail,
             )

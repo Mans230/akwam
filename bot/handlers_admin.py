@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 
 from aiogram import F, Router
@@ -16,10 +15,9 @@ from .config import settings
 from .db import Database
 from .downloader import DownloadManager
 from .keyboards import admin_kb, sites_kb, user_manage_kb
+from .textutil import MESSAGE_LIMIT, esc as _esc, truncate_html
 
 log = logging.getLogger(__name__)
-
-_esc = html.escape
 
 router = Router(name="admin")
 router.message.filter(F.from_user.id.in_(settings.ADMIN_IDS))
@@ -230,7 +228,12 @@ async def adm_user_search(message: Message, state: FSMContext, db: Database) -> 
             f"({_esc('@' + u['username']) if u.get('username') else 'بدون يوزر'})"
             for u in users
         )
-        await message.answer(f"لقيت {len(users)} مستخدمين:\n{listing}\n\nدي بيانات أول واحد 👇")
+        await message.answer(
+            truncate_html(
+                f"لقيت {len(users)} مستخدمين:\n{listing}\n\nدي بيانات أول واحد 👇",
+                MESSAGE_LIMIT,
+            )
+        )
     u = users[0]
     await message.answer(
         _user_card(u),
@@ -326,7 +329,7 @@ async def adm_bans(callback: CallbackQuery, db: Database) -> None:
         for u in banned:
             username = f"@{u['username']}" if u.get("username") else "—"
             lines.append(f"• <code>{u['id']}</code> — {_esc(u.get('first_name') or '')} ({_esc(username)})")
-        text = "\n".join(lines)
+        text = truncate_html("\n".join(lines), MESSAGE_LIMIT)
     try:
         await callback.message.edit_text(text, reply_markup=admin_kb())
     except TelegramBadRequest:
@@ -373,7 +376,7 @@ async def adm_pending(callback: CallbackQuery, db: Database) -> None:
                 ]
             )
         buttons.append([InlineKeyboardButton(text="🔙 لوحة الأدمن", callback_data="adm:home")])
-        text = "\n".join(lines)
+        text = truncate_html("\n".join(lines), MESSAGE_LIMIT)
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     try:
         await callback.message.edit_text(text, reply_markup=kb)

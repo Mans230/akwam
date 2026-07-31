@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import re
 from dataclasses import dataclass
@@ -48,12 +47,11 @@ from .keyboards import (
     try_akwam_kb,
 )
 from .middlewares import is_subscribed
+from .textutil import CAPTION_LIMIT, MESSAGE_LIMIT, esc as _esc, truncate_html
 
 log = logging.getLogger(__name__)
 
 router = Router()
-
-_esc = html.escape
 
 WELCOME = (
     "أهلاً بيك في <b>بوت أكوام</b> 🍿\n\n"
@@ -83,7 +81,7 @@ def _results_text(query: str, results: list[SearchResult], badge: str = "🔵") 
         lines.append(f"{badge}{i + 1}. {_type_ar(r.type)} <b>{_esc(r.title)}</b>{year}{rating}")
     lines.append("\nاختار من الأزرار تحت 👇")
     text = "\n".join(lines)
-    return text[:1000]  # حد كابشن الصور
+    return truncate_html(text, CAPTION_LIMIT)  # حد كابشن الصور بأمان
 
 
 def _sc_results_text(query: str, items: list[dict]) -> str:
@@ -96,7 +94,7 @@ def _sc_results_text(query: str, items: list[dict]) -> str:
         rating = f" ⭐ {r.rating}" if r.rating else ""
         lines.append(f"{badge}{i + 1}. {_type_ar(r.type)} <b>{_esc(r.title)}</b>{year}{rating}")
     lines.append("\nاختار من الأزرار تحت 👇")
-    return "\n".join(lines)[:1000]
+    return truncate_html("\n".join(lines), CAPTION_LIMIT)
 
 
 def _first_poster(results: list[SearchResult]) -> str | None:
@@ -116,6 +114,8 @@ async def _respond(
     msg = callback.message
     if msg is None:
         return
+    # شبكة أمان: حد الكابشن 1024 / الرسالة 4096 — قص واعي بالوسوم بدون كسر HTML
+    text = truncate_html(text, CAPTION_LIMIT if photo else MESSAGE_LIMIT)
     try:
         if photo:
             await msg.edit_media(
@@ -333,7 +333,7 @@ async def on_search(message: Message, cache: TTLCache, db: Database) -> None:
     akwam_on = await _site_enabled(db, "akwam")
     starcima_on = await _site_enabled(db, "starcima")
     await message.answer(
-        f"🔍 «{_esc(query)}»\nاختار الموقع اللي أدور فيه 👇",
+        truncate_html(f"🔍 «{_esc(query)}»\nاختار الموقع اللي أدور فيه 👇", MESSAGE_LIMIT),
         reply_markup=site_picker_kb(key, akwam_on, starcima_on),
     )
 
@@ -473,11 +473,12 @@ async def _show_movie(
     if len(desc) > 350:
         desc = desc[:347] + "…"
     quals = ", ".join(q.quality for q in movie.qualities) or "غير متاحة"
-    caption = (
+    caption = truncate_html(
         f"🎬 <b>{_esc(movie.title)}</b>{year}\n"
         f"{rating}\n{_esc(desc)}\n\n"
-        f"💾 الجودات المتاحة: <b>{_esc(quals)}</b>"
-    )[:1000]
+        f"💾 الجودات المتاحة: <b>{_esc(quals)}</b>",
+        CAPTION_LIMIT,
+    )
     await _respond(callback, caption, movie_kb(movie), photo=movie.poster)
 
 
@@ -609,11 +610,12 @@ async def _show_sc_movie(
     desc = (media.description or "").strip()
     if len(desc) > 350:
         desc = desc[:347] + "…"
-    caption = (
+    caption = truncate_html(
         f"🎬 <b>{_esc(media.title_ar)}</b>{year} — ⭐ ستار سيما\n"
         f"{rating}\n{_esc(desc)}\n\n"
-        "اختار من تحت 👇"
-    )[:1000]
+        "اختار من تحت 👇",
+        CAPTION_LIMIT,
+    )
     watch_url = _sc_watch_url(tmdb, "movie", media.title_ar, media.title_en)
     await _respond(callback, caption, sc_movie_kb(tmdb, ckey, watch_url), photo=media.poster)
 
@@ -725,11 +727,12 @@ async def on_sc_episode(callback: CallbackQuery, starcima: StarcimaClient, cache
     overview = (ep.overview or "").strip()
     if len(overview) > 300:
         overview = overview[:297] + "…"
-    text = (
+    text = truncate_html(
         f"📺 <b>{_esc(display)}</b> — ⭐ ستار سيما\n"
         + (f"\n{_esc(overview)}\n" if overview else "")
-        + "\nاختار من تحت 👇"
-    )[:1000]
+        + "\nاختار من تحت 👇",
+        CAPTION_LIMIT,
+    )
     watch_url = _sc_watch_url(
         tmdb_i, "series", media.title_ar, media.title_en, season_i, ep_i
     )
@@ -1304,6 +1307,6 @@ async def on_checksub(callback: CallbackQuery) -> None:
         await callback.message.answer("✅ جميل! دلوقتي ابعت اسم الفيلم أو المسلسل 👇")
     else:
         await callback.answer(
-            f"❌ لسه مشتركتش في القناة {channel} — اشترك الأول وبعدين اضغط تحققت.",
+            f"❌ لسه مشتركتش في القناة {_esc(channel)} — اشترك الأول وبعدين اضغط تحققت.",
             show_alert=True,
         )
