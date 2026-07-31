@@ -154,6 +154,19 @@ class DownloadManager:
         limit = await self.db.get_user_limit(user_id)
         return limit if limit else self.default_limit
 
+    async def _segments_for(self, user_id: int) -> tuple[int, bool]:
+        """(عدد القطع, هل بريميوم) — البريميوم ياخد PREMIUM_SEGMENTS."""
+        try:
+            premium = await self.db.is_premium(user_id)
+        except Exception:  # noqa: BLE001
+            log.exception("is_premium check failed for %s", user_id)
+            premium = False
+        if premium:
+            from .config import settings
+
+            return max(1, int(getattr(settings, "PREMIUM_SEGMENTS", 16))), True
+        return self.segments, False
+
     async def _user_worker(self, user_id: int) -> None:
         queue = self._queues[user_id]
         while True:
@@ -184,7 +197,8 @@ class DownloadManager:
                 f"⏳ بدأ تحميل «{job.title}»…",
                 reply_markup=cancel_kb(job.task_id),
             )
-            await self._download_file(job, path, status_msg)
+            segments, premium = await self._segments_for(user_id)
+            await self._download_file(job, path, status_msg, segments=segments, premium=premium)
             await self._upload_file(job, path, chat_id, status_msg)
             await self.db.log_download(user_id, job.title, quality, "done")
             await self._safe_edit(status_msg, f"✅ خلص واتبعت: «{job.title}»")
@@ -206,16 +220,27 @@ class DownloadManager:
                 except OSError:
                     pass
 
-    async def _download_file(self, job: DownloadJob, path: str, status_msg: Message) -> None:
+    async def _download_file(
+        self,
+        job: DownloadJob,
+        path: str,
+        status_msg: Message,
+        segments: int | None = None,
+        premium: bool = False,
+    ) -> None:
+        if segments is None:
+            segments = self.segments
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=httpx.Timeout(60.0, read=300.0),
             headers={"User-Agent": _UA},
         ) as client:
             total, ranges_ok = await self._probe(client, job.url)
-            if ranges_ok and total > _MIN_PARALLEL_SIZE and self.segments > 1:
+            if ranges_ok and total > _MIN_PARALLEL_SIZE and segments > 1:
                 try:
-                    await self._download_parallel(client, job, path, status_msg, total)
+                    await self._download_parallel(
+                        client, job, path, status_msg, total, segments, premium
+                    )
                     return
                 except asyncio.CancelledError:
                     raise
@@ -278,8 +303,12 @@ class DownloadManager:
         path: str,
         status_msg: Message,
         total: int,
+        segments: int | None = None,
+        premium: bool = False,
     ) -> None:
-        n = max(1, min(self.segments, total // 1024**2))
+        if segments is None:
+            segments = self.segments
+        n = max(1, min(segments, total // 1024**2))
         base = total // n
         ranges = [
             (i * base, (i + 1) * base - 1 if i < n - 1 else total - 1)
@@ -290,7 +319,7 @@ class DownloadManager:
         ]
         progress = [0] * n
         reporter = asyncio.create_task(
-            self._report_parallel(job, status_msg, progress, total, n)
+            self._report_parallel(job, status_msg, progress, total, n, premium)
         )
         try:
             await asyncio.gather(
@@ -369,8 +398,14 @@ class DownloadManager:
         progress: list[int],
         total: int,
         n: int,
+        premium: bool = False,
     ) -> None:
         """تحديث رسالة التقدم من مجموع القطع بنفس إيقاع ~5 ثواني."""
+        mode = (
+            f"⚡ تحميل متوازي ⭐ بريميوم ({n} قطعة)"
+            if premium
+            else f"⚡ تحميل متوازي ({n} قطع)"
+        )
         last_edit = time.monotonic()
         last_bytes = 0
         while True:
@@ -384,7 +419,7 @@ class DownloadManager:
                 f"⬇️ بيتم تحميل «{job.title}»\n"
                 f"📊 {percent} — 🚀 {speed:.1f} MB/s\n"
                 f"💾 {_fmt_size(downloaded)} / {_fmt_size(total)}\n"
-                f"⚡ تحميل متوازي ({n} قطع)",
+                f"{mode}",
                 with_kb=job.task_id,
             )
             last_edit = now

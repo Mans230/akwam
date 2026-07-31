@@ -102,6 +102,19 @@ async def _respond(
         await msg.answer(text, reply_markup=kb)
 
 
+PREMIUM_ONLY_MSG = (
+    "🔒 الإرسال المباشر على تليجرام للمشتركين البريميوم بس — "
+    "استخدم روابط التحميل أو المشاهدة 👇"
+)
+
+
+async def _send_allowed(db: Database, user_id: int) -> bool:
+    """الإرسال المباشر لتليجرام: بريميوم أو أدمن بس."""
+    if user_id in settings.ADMIN_IDS:
+        return True
+    return await db.is_premium(user_id)
+
+
 def _pick_quality(items, token: str):
     """يختار العنصر المطابق للجودة، وإلا أقرب جودة."""
     if not items:
@@ -366,7 +379,11 @@ async def on_send(
     akwam: AkwamClient,
     cache: TTLCache,
     downloader: DownloadManager,
+    db: Database,
 ) -> None:
+    if not await _send_allowed(db, callback.from_user.id):
+        await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
+        return
     _, fid, cid, q = callback.data.split(":", 3)
     await callback.answer("⏳ بجهز التحميل…")
     links = await _get_links(akwam, int(fid), int(cid))
@@ -389,7 +406,10 @@ async def on_send(
 # ---------- تحميل الموسم كامل ----------
 
 @router.callback_query(F.data.startswith("sall:"))
-async def on_season_all(callback: CallbackQuery, akwam: AkwamClient) -> None:
+async def on_season_all(callback: CallbackQuery, akwam: AkwamClient, db: Database) -> None:
+    if not await _send_allowed(db, callback.from_user.id):
+        await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
+        return
     series_id = int(callback.data.split(":")[1])
     await callback.answer("⏳ بشوف الجودات المتاحة…")
     try:
@@ -418,7 +438,11 @@ async def on_season_all_quality(
     callback: CallbackQuery,
     akwam: AkwamClient,
     downloader: DownloadManager,
+    db: Database,
 ) -> None:
+    if not await _send_allowed(db, callback.from_user.id):
+        await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
+        return
     _, sid, q = callback.data.split(":", 2)
     series_id = int(sid)
     await callback.answer("⏳ بجهز حلقات الموسم…")

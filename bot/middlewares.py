@@ -1,17 +1,18 @@
-"""ميدل ويرز: تسجيل المستخدم + الحظر + الاشتراك الإجباري (حسب SPEC 3.10)."""
+"""ميدل ويرز: تسجيل المستخدم + الحظر + موافقة الإدارة + الاشتراك الإجباري (حسب SPEC 3.10)."""
 from __future__ import annotations
 
+import html
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from aiogram import BaseMiddleware
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import CallbackQuery, Message, TelegramObject
+from aiogram.types import CallbackQuery, Message, TelegramObject, User
 
 from .config import settings
 from .db import Database
-from .keyboards import force_sub_kb
+from .keyboards import approval_kb, force_sub_kb
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,59 @@ class BanMiddleware(BaseMiddleware):
         elif isinstance(event, Message):
             await event.answer("🚫 تم حظرك من استخدام البوت.")
         return None
+
+
+class ApprovalMiddleware(BaseMiddleware):
+    """موافقة الإدارة قبل الاستخدام — شغالة بس لو REQUIRE_APPROVAL مفعّل.
+
+    - الأدمن يمر دائماً، والمحظور (مرفوض) يتصدى له BanMiddleware قبلنا.
+    - غير الموافق عليه: أول مرة → يتسجل pending + إبلاغ الأدمنز بأزرار القرار،
+      وبعدها → رسالة "لسه مستني موافقة".
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+        self._notified: set[int] = set()  # يوزرات اتبعت طلباتها للأدمن في الجلسة دي
+
+    async def __call__(self, handler: Handler, event: TelegramObject, data: dict[str, Any]) -> Any:
+        if not settings.REQUIRE_APPROVAL:
+            return await handler(event, data)
+        user = data.get("event_from_user")
+        if user is None or user.id in settings.ADMIN_IDS:
+            return await handler(event, data)
+        try:
+            approved = await self.db.is_approved(user.id)
+        except Exception:  # noqa: BLE001
+            log.exception("is_approved check failed for %s", user.id)
+            approved = True  # fail-open زي باقي الميدل ويرز
+        if approved:
+            return await handler(event, data)
+        if user.id in self._notified:
+            reply = "⏳ طلبك لسه مستني موافقة الإدارة"
+        else:
+            self._notified.add(user.id)
+            reply = "⏳ طلبك اتبعت للإدارة، هيوصلك رد قريب"
+            await self._notify_admins(data["bot"], user)
+        if isinstance(event, CallbackQuery):
+            await event.answer(reply, show_alert=True)
+        elif isinstance(event, Message):
+            await event.answer(reply)
+        return None
+
+    async def _notify_admins(self, bot, user: User) -> None:
+        username = f"@{user.username}" if user.username else "—"
+        name = html.escape(user.full_name or "—")
+        text = (
+            "🆕 <b>طلب انضمام جديد</b>\n\n"
+            f"👤 الاسم: {name}\n"
+            f"🔗 اليوزرنيم: {username}\n"
+            f"🆔 الآيدي: <code>{user.id}</code>"
+        )
+        for admin_id in settings.ADMIN_IDS:
+            try:
+                await bot.send_message(admin_id, text, reply_markup=approval_kb(user.id))
+            except Exception:  # noqa: BLE001
+                log.exception("approval notify failed for admin %s", admin_id)
 
 
 class ForceSubMiddleware(BaseMiddleware):

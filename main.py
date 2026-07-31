@@ -19,7 +19,12 @@ from bot.db import Database
 from bot.downloader import DownloadManager
 from bot.handlers_admin import router as admin_router
 from bot.handlers_user import router as user_router
-from bot.middlewares import BanMiddleware, ForceSubMiddleware, UserTrackMiddleware
+from bot.middlewares import (
+    ApprovalMiddleware,
+    BanMiddleware,
+    ForceSubMiddleware,
+    UserTrackMiddleware,
+)
 
 log = logging.getLogger("akwam-bot")
 
@@ -55,11 +60,13 @@ async def main() -> None:
     dp["cache"] = cache
     dp["downloader"] = downloader
 
-    # ترتيب الميدل وير: تسجيل → حظر → اشتراك إجباري
+    # ترتيب الميدل وير: تسجيل → حظر → موافقة الإدارة → اشتراك إجباري
     dp.message.outer_middleware(UserTrackMiddleware(db))
     dp.callback_query.outer_middleware(UserTrackMiddleware(db))
     dp.message.outer_middleware(BanMiddleware(db))
     dp.callback_query.outer_middleware(BanMiddleware(db))
+    dp.message.outer_middleware(ApprovalMiddleware(db))
+    dp.callback_query.outer_middleware(ApprovalMiddleware(db))
     dp.message.outer_middleware(ForceSubMiddleware(settings.FORCE_CHANNEL))
     dp.callback_query.outer_middleware(ForceSubMiddleware(settings.FORCE_CHANNEL))
 

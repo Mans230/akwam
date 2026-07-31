@@ -41,7 +41,7 @@ def _quality_rows(builder: InlineKeyboardBuilder, file_id: int, content_id: int,
     q = _q_token(quality)
     builder.row(
         InlineKeyboardButton(
-            text=f"⬇️ إرسال {quality}",
+            text=f"⬇️ إرسال {quality} ⭐",
             callback_data=_check_cb(f"send:{file_id}:{content_id}:{q}"),
         ),
         InlineKeyboardButton(
@@ -105,7 +105,7 @@ def series_kb(
     builder.row(*nav)
     builder.row(
         InlineKeyboardButton(
-            text="⬇️ تحميل الموسم كامل", callback_data=_check_cb(f"sall:{series_id}")
+            text="⬇️ تحميل الموسم كامل ⭐", callback_data=_check_cb(f"sall:{series_id}")
         )
     )
     builder.row(InlineKeyboardButton(text="🔙 رجوع للنتايج", callback_data=_check_cb("back")))
@@ -150,7 +150,7 @@ def season_all_kb(series_id: int, qualities: list[str]) -> InlineKeyboardMarkup:
     for q in qualities:
         builder.row(
             InlineKeyboardButton(
-                text=f"⬇️ الموسم كامل {q}",
+                text=f"⬇️ الموسم كامل {q} ⭐",
                 callback_data=_check_cb(f"sallq:{series_id}:{_q_token(q)}"),
             )
         )
@@ -180,6 +180,21 @@ def force_sub_kb(channel: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def approval_kb(user_id: int) -> InlineKeyboardMarkup:
+    """أزرار قرار الأدمن على طلب انضمام (cb='acc:ok/prem/no:{uid}')."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ موافقة", callback_data=_check_cb(f"acc:ok:{user_id}"))],
+            [
+                InlineKeyboardButton(
+                    text="⭐ موافقة + بريميوم", callback_data=_check_cb(f"acc:prem:{user_id}")
+                )
+            ],
+            [InlineKeyboardButton(text="❌ رفض", callback_data=_check_cb(f"acc:no:{user_id}"))],
+        ]
+    )
+
+
 def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -191,19 +206,30 @@ def admin_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="👤 إدارة مستخدم", callback_data=_check_cb("adm:user")),
                 InlineKeyboardButton(text="🚫 محظورون", callback_data=_check_cb("adm:bans")),
             ],
+            [
+                InlineKeyboardButton(text="⏳ طلبات معلقة", callback_data=_check_cb("adm:pending")),
+            ],
         ]
     )
 
 
-def user_manage_kb(user_id: int, is_banned: bool) -> InlineKeyboardMarkup:
+def user_manage_kb(
+    user_id: int, is_banned: bool, is_premium: bool = False
+) -> InlineKeyboardMarkup:
     ban_btn = (
         InlineKeyboardButton(text="✅ فك الحظر", callback_data=_check_cb(f"adm:unban:{user_id}"))
         if is_banned
         else InlineKeyboardButton(text="🚫 حظر", callback_data=_check_cb(f"adm:ban:{user_id}"))
     )
+    prem_btn = (
+        InlineKeyboardButton(text="⭐ إلغاء بريميوم", callback_data=_check_cb(f"adm:unprem:{user_id}"))
+        if is_premium
+        else InlineKeyboardButton(text="⭐ تفعيل بريميوم", callback_data=_check_cb(f"adm:prem:{user_id}"))
+    )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [ban_btn],
+            [prem_btn],
             [InlineKeyboardButton(text="🔢 تعيين حد التزامن", callback_data=_check_cb(f"adm:lim:{user_id}"))],
         ]
     )
