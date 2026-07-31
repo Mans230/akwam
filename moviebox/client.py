@@ -66,7 +66,7 @@ def _year(date_str: str | None) -> int | None:
 
 
 class MovieboxClient:
-    """عميل themoviebox: بحث (Bearer كسول) + الرائج + تفاصيل + جودات/ترجمات."""
+    """عميل themoviefbox: بحث (Bearer كسول) + الرائج + تفاصيل + جودات/ترجمات."""
 
     def __init__(
         self,
@@ -394,7 +394,13 @@ class MovieboxClient:
         captions = self._parse_captions(data.get("captions"))
         if not captions and first_stream_id:
             captions = await self._fetch_captions(first_stream_id, subject_id, se, ep)
-        return MbStreams(qualities=qualities, captions=captions)
+
+        # مسار DASH بديل عبر بروكسي الـ API (الـ CDN المباشر بيحظر آي بيهات الداتاسنتر)
+        dash_url: str | None = None
+        dash_list = data.get("dash") or []
+        if dash_list and isinstance(dash_list[0], dict):
+            dash_url = dash_list[0].get("url") or None
+        return MbStreams(qualities=qualities, captions=captions, dash_url=dash_url)
 
     async def _fetch_captions(
         self, stream_id: str, subject_id: str, se: int, ep: int

@@ -59,3 +59,4 @@ class MbDetails:
 class MbStreams:
     qualities: list[MbQuality] = field(default_factory=list)   # مرتبة تنازلياً بالدقة، vip_locked/url فارغ مستبعد
     captions: list[MbCaption] = field(default_factory=list)
+    dash_url: str | None = None   # رابط MPD بديل عبر بروكسي الـ API (لتحميل DASH احتياطي)
