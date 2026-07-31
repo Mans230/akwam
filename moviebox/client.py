@@ -66,7 +66,7 @@ def _year(date_str: str | None) -> int | None:
 
 
 class MovieboxClient:
-    """عميل themoviefbox: بحث (Bearer كسول) + الرائج + تفاصيل + جودات/ترجمات."""
+    """عميل themoviebox: بحث (Bearer كسول) + الرائج + تفاصيل + جودات/ترجمات."""
 
     def __init__(
         self,
