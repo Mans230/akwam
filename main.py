@@ -12,6 +12,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from akwam import AkwamClient
+from moviebox import MovieboxClient
 from starcima import StarcimaClient
 
 from bot.cache import TTLCache
@@ -52,6 +53,7 @@ async def main() -> None:
 
     akwam = AkwamClient(base_url=settings.AKWAM_DOMAIN)
     starcima = StarcimaClient(base_url=settings.STARCIMA_DOMAIN)
+    moviebox = MovieboxClient(base_url=settings.MOVIEBOX_DOMAIN)
     cache = TTLCache(ttl_seconds=settings.CACHE_TTL_HOURS * 3600)
     bot = _build_bot()
     downloader = DownloadManager(bot, db, settings.DOWNLOAD_DIR, settings.DEFAULT_MAX_CONCURRENT)
@@ -60,6 +62,7 @@ async def main() -> None:
     dp["db"] = db
     dp["akwam"] = akwam
     dp["starcima"] = starcima
+    dp["moviebox"] = moviebox
     dp["cache"] = cache
     dp["downloader"] = downloader
 
@@ -80,6 +83,7 @@ async def main() -> None:
     log.info("البوت اشتغل ✅ @%s (id=%s)", me.username, me.id)
     log.info("دومين أكوام: %s — أدمن: %s", settings.AKWAM_DOMAIN, settings.ADMIN_IDS)
     log.info("دومين ستار سيما: %s", settings.STARCIMA_DOMAIN)
+    log.info("دومين موفي بوكس: %s", settings.MOVIEBOX_DOMAIN)
     if settings.FORCE_CHANNEL:
         log.info("اشتراك إجباري على: %s", settings.FORCE_CHANNEL)
 
@@ -90,6 +94,7 @@ async def main() -> None:
         await downloader.shutdown()
         await akwam.close()
         await starcima.close()
+        await moviebox.close()
         await db.close()
         await bot.session.close()
         log.info("اتقفل نضيف 👋")
