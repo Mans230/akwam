@@ -5,7 +5,9 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 
 import httpx
@@ -27,6 +29,8 @@ _CHUNK = 256 * 1024
 _EDIT_EVERY = 5.0  # ثواني بين تحديثات رسالة التقدم
 _MIN_PARALLEL_SIZE = 10 * 1024**2  # التحميل المتوازي للملفات الأكبر من 10MB فقط
 _SEGMENT_RETRIES = 3  # محاولات لكل قطعة قبل الرجوع للتدفق الواحد
+_DASH_CONCURRENCY = 10  # تحميلات سجمنتات DASH المتزامنة
+_DASH_RETRIES = 3  # محاولات لكل سجمنت DASH
 
 
 @dataclass
@@ -37,6 +41,8 @@ class DownloadJob:
     caption: str  # كابشن الفيديو
     thumb_url: str | None = None
     referer: str | None = None  # هيدر Referer للمواقع اللي بتطلبه (مثل موفي بوكس)
+    dash_url: str | None = None  # رابط MPD احتياطي (موفي بوكس) لو الـ CDN حظر الـ IP
+    dash_res: int | None = None  # الدقة المطلوبة من الـ DASH (مطابقة الجودة المختارة)
 
 
 def _fmt_size(n: float) -> str:
@@ -52,6 +58,127 @@ def _fmt_size(n: float) -> str:
 def _extract_quality(title: str) -> str:
     m = re.search(r"\(([^()]+)\)\s*$", title)
     return m.group(1) if m else "-"
+
+
+# ---------- بارس MPD (DASH) — مسار موفي بوكس الاحتياطي ----------
+
+
+def _local(tag: str) -> str:
+    """اسم العنصر بدون الـ namespace (MPD بنيم سبيس urn:mpeg:dash:schema:mpd:2011)."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _find_child(el: ET.Element, name: str) -> ET.Element | None:
+    for child in el:
+        if _local(child.tag) == name:
+            return child
+    return None
+
+
+@dataclass
+class _DashTrack:
+    rep_id: str
+    res: int | None  # ارتفاع الفيديو (None للأوديو)
+    init_url: str
+    seg_urls: list[str]
+
+
+_VIDEO_CODECS = ("hev1", "hvc1", "avc1", "av01", "vp9", "vp09")
+_AUDIO_CODECS = ("mp4a", "ac-3", "ec-3", "opus")
+
+
+def _dash_kind(aset: ET.Element, rep: ET.Element) -> str | None:
+    """تصنيف الـ Representation: فيديو وإلا أوديو وإلا None (نتجاهلها)."""
+    ct = (aset.get("contentType") or rep.get("mimeType") or aset.get("mimeType") or "").lower()
+    if ct.startswith("video"):
+        return "video"
+    if ct.startswith("audio"):
+        return "audio"
+    codecs = (rep.get("codecs") or aset.get("codecs") or "").lower()
+    if codecs.startswith(_VIDEO_CODECS):
+        return "video"
+    if codecs.startswith(_AUDIO_CODECS):
+        return "audio"
+    return None
+
+
+def _expand_number(url: str, n: int) -> str:
+    """استبدالات قوالب السجمنتات: $Number%05d$ ثم $Number$."""
+    url = re.sub(
+        r"\$Number%0?(\d+)d\$",
+        lambda m: f"{n:0{int(m.group(1))}d}",
+        url,
+    )
+    return url.replace("$Number$", str(n))
+
+
+def _build_dash_track(rep_id: str, res: int | None, template: ET.Element) -> _DashTrack:
+    """يبني init URL + قائمة URLs السجمنتات من SegmentTemplate/SegmentTimeline.
+
+    الروابط في attributes — ElementTree بيفك &amp; تلقائياً (ممنوع unescape يدوي).
+    عدد السجمنتات = مجموع (1 + r) على كل عنصر S في SegmentTimeline.
+    """
+    init_t = template.get("initialization")
+    media_t = template.get("media")
+    if not init_t or not media_t:
+        raise RuntimeError("SegmentTemplate ناقص (initialization/media) في MPD")
+    start = int(template.get("startNumber") or 1)
+    count = 0
+    timeline = _find_child(template, "SegmentTimeline")
+    if timeline is not None:
+        for s in timeline:
+            if _local(s.tag) == "S":
+                count += 1 + int(s.get("r") or 0)
+    if count <= 0:
+        raise RuntimeError("مفيش سجمنتات في SegmentTimeline بتاع MPD")
+    init_url = init_t.replace("$RepresentationID$", rep_id)
+    seg_urls = [
+        _expand_number(media_t.replace("$RepresentationID$", rep_id), n)
+        for n in range(start, start + count)
+    ]
+    return _DashTrack(rep_id=rep_id, res=res, init_url=init_url, seg_urls=seg_urls)
+
+
+def _parse_mpd(mpd_xml: str, dash_res: int | None) -> tuple[_DashTrack, _DashTrack]:
+    """يرجع (مسار الفيديو الأنسب لـ dash_res, أول مسار أوديو) من MPD.
+
+    اختيار الفيديو: تطابق تام → وإلا الأقرب، وعند التعادل الأقل دقة.
+    """
+    root = ET.fromstring(mpd_xml)
+    videos: list[tuple[str, int | None, ET.Element]] = []
+    audios: list[tuple[str, int | None, ET.Element]] = []
+    for aset in root.iter():
+        if _local(aset.tag) != "AdaptationSet":
+            continue
+        aset_template = _find_child(aset, "SegmentTemplate")
+        for rep in aset:
+            if _local(rep.tag) != "Representation":
+                continue
+            kind = _dash_kind(aset, rep)
+            if kind is None:
+                continue
+            template = _find_child(rep, "SegmentTemplate") or aset_template
+            if template is None:
+                continue
+            try:
+                height = int(rep.get("height") or 0) or None
+            except ValueError:
+                height = None
+            entry = (str(rep.get("id") or "0"), height, template)
+            (videos if kind == "video" else audios).append(entry)
+    if not videos or not audios:
+        raise RuntimeError("MPD مفيهوش مسارات فيديو/أوديو صالحة")
+
+    if dash_res is None:
+        chosen_v = max(videos, key=lambda v: v[1] or 0)
+    else:
+        exact = [v for v in videos if v[1] == dash_res]
+        chosen_v = exact[0] if exact else min(
+            videos, key=lambda v: (abs((v[1] or 0) - dash_res), v[1] or 0)
+        )
+    video = _build_dash_track(*chosen_v)
+    audio = _build_dash_track(*audios[0])
+    return video, audio
 
 
 class DownloadManager:
@@ -240,21 +367,34 @@ class DownloadManager:
             timeout=httpx.Timeout(60.0, read=300.0),
             headers=req_headers,
         ) as client:
-            total, ranges_ok = await self._probe(client, job.url)
-            if ranges_ok and total > _MIN_PARALLEL_SIZE and segments > 1:
-                try:
-                    await self._download_parallel(
-                        client, job, path, status_msg, total, segments, premium
-                    )
-                    return
-                except asyncio.CancelledError:
+            try:
+                total, ranges_ok = await self._probe(client, job.url)
+                if ranges_ok and total > _MIN_PARALLEL_SIZE and segments > 1:
+                    try:
+                        await self._download_parallel(
+                            client, job, path, status_msg, total, segments, premium
+                        )
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception(
+                            "parallel download failed, falling back to single stream: %s",
+                            job.task_id,
+                        )
+                await self._download_stream(client, job, path, status_msg)
+            except asyncio.CancelledError:
+                raise
+            except (httpx.HTTPStatusError, httpx.TransportError):
+                if not job.dash_url:
                     raise
-                except Exception:
-                    log.exception(
-                        "parallel download failed, falling back to single stream: %s",
-                        job.task_id,
-                    )
-            await self._download_stream(client, job, path, status_msg)
+                # الـ CDN بيحظر آي بيهات الداتاسنتر (403) — نجرّب مسار DASH الاحتياطي
+                log.warning(
+                    "MP4 download failed (%s), trying DASH fallback: %s",
+                    job.url,
+                    job.task_id,
+                )
+                await self._download_dash(client, job, path, status_msg)
 
     async def _probe(self, client: httpx.AsyncClient, url: str) -> tuple[int, bool]:
         """HEAD على الرابط: يرجع (الحجم, هل السيرفر يدعم Range). أي فشل = وضع عادي."""
@@ -429,6 +569,120 @@ class DownloadManager:
             )
             last_edit = now
             last_bytes = downloaded
+
+    # ---------- مسار DASH الاحتياطي (موفي بوكس — CDN بيحظر الداتاسنتر) ----------
+
+    async def _download_dash(
+        self, client: httpx.AsyncClient, job: DownloadJob, path: str, status_msg: Message
+    ) -> None:
+        """تحميل DASH كامل: MPD → سجمنتات → concat → remux بـ ffmpeg إلى path."""
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg غير مثبت في الصورة")
+        resp = await client.get(job.dash_url)
+        resp.raise_for_status()
+        video_track, audio_track = _parse_mpd(resp.text, job.dash_res)
+        res_label = video_track.res or job.dash_res or 0
+
+        tmp_dir = f"{path}.dash_tmp"
+        os.makedirs(tmp_dir, exist_ok=True)
+        video_out = os.path.join(tmp_dir, "video.m4s")
+        audio_out = os.path.join(tmp_dir, "audio.m4s")
+        try:
+            tracks = (("v", video_track, video_out), ("a", audio_track, audio_out))
+            total = sum(1 + len(track.seg_urls) for _, track, _ in tracks)
+            done = [0]
+            done_bytes = [0]
+            sem = asyncio.Semaphore(_DASH_CONCURRENCY)
+
+            async def _fetch(url: str, dest: str) -> None:
+                for attempt in range(1, _DASH_RETRIES + 1):
+                    try:
+                        async with sem:
+                            r = await client.get(url)
+                            r.raise_for_status()
+                            data = r.content
+                        with open(dest, "wb") as f:
+                            f.write(data)
+                        done[0] += 1
+                        done_bytes[0] += len(data)
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if attempt == _DASH_RETRIES:
+                            raise
+                        await asyncio.sleep(2 ** (attempt - 1))
+
+            downloads: list[tuple[str, str]] = []
+            for prefix, track, _ in tracks:
+                downloads.append((track.init_url, os.path.join(tmp_dir, f"{prefix}_init.m4s")))
+                for i, seg_url in enumerate(track.seg_urls, start=1):
+                    downloads.append((seg_url, os.path.join(tmp_dir, f"{prefix}_{i:06d}.m4s")))
+
+            reporter = asyncio.create_task(
+                self._report_dash(job, status_msg, done, done_bytes, total, res_label)
+            )
+            try:
+                await asyncio.gather(*(_fetch(url, dest) for url, dest in downloads))
+            finally:
+                reporter.cancel()
+                await asyncio.gather(reporter, return_exceptions=True)
+
+            # concat بترتيب الأرقام (init أولاً)
+            for prefix, track, out in tracks:
+                with open(out, "wb") as dst:
+                    with open(os.path.join(tmp_dir, f"{prefix}_init.m4s"), "rb") as f:
+                        shutil.copyfileobj(f, dst)
+                    for i in range(1, len(track.seg_urls) + 1):
+                        with open(os.path.join(tmp_dir, f"{prefix}_{i:06d}.m4s"), "rb") as f:
+                            shutil.copyfileobj(f, dst)
+
+            # remux: h265/aac copy داخل mp4 + faststart
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", video_out, "-i", audio_out,
+                "-c", "copy", "-movflags", "+faststart", path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await proc.communicate()
+            except asyncio.CancelledError:
+                proc.kill()
+                await proc.wait()
+                raise
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"ffmpeg remux فشل ({proc.returncode}): {stderr.decode(errors='replace')[:300]}"
+                )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    async def _report_dash(
+        self,
+        job: DownloadJob,
+        status_msg: Message,
+        done: list[int],
+        done_bytes: list[int],
+        total: int,
+        res_label: int,
+    ) -> None:
+        """تحديث رسالة التقدم لتحميل DASH بنفس إيقاع ~5 ثواني."""
+        last_edit = time.monotonic()
+        last_bytes = 0
+        while True:
+            await asyncio.sleep(_EDIT_EVERY)
+            now = time.monotonic()
+            speed = (done_bytes[0] - last_bytes) / (now - last_edit) / 1024**2
+            await self._safe_edit(
+                status_msg,
+                f"⬇️ بيتم تحميل «{_esc(job.title)}»\n"
+                f"📊 {done[0]}/{total} قطعة (DASH {res_label}p)\n"
+                f"🚀 {speed:.1f} MB/s",
+                with_kb=job.task_id,
+            )
+            last_edit = now
+            last_bytes = done_bytes[0]
 
     async def _upload_file(
         self, job: DownloadJob, path: str, chat_id: int, status_msg: Message
