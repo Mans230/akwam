@@ -60,3 +60,15 @@ class MbStreams:
     qualities: list[MbQuality] = field(default_factory=list)   # مرتبة تنازلياً بالدقة، vip_locked/url فارغ مستبعد
     captions: list[MbCaption] = field(default_factory=list)
     dash_url: str | None = None   # رابط MPD بديل عبر بروكسي الـ API (لتحميل DASH احتياطي)
+    hls_map: dict[int, str] = field(default_factory=dict)   # دقة → رابط m3u8 عبر بروكسي الـ API (مرآة HLS)
+
+    def hls_for(self, res: int | None) -> str | None:
+        """أقرب رابط HLS للدقة المطلوبة (تطابق تام أولاً ثم الأقرب قيمة)."""
+        if not self.hls_map:
+            return None
+        if res in self.hls_map:
+            return self.hls_map[res]
+        if res is None:
+            return self.hls_map[max(self.hls_map)]
+        closest = min(self.hls_map, key=lambda r: abs(r - res))
+        return self.hls_map[closest]
