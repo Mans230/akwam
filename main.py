@@ -1,4 +1,4 @@
-"""نقطة تشغيل البوت: تهيئة المكونات + بدء polling."""
+"""نقطة تشغيل بوت أكوام (حسب SPEC 3.11)."""
 from __future__ import annotations
 
 import asyncio
@@ -9,6 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from akwam import AkwamClient
 from moviebox import MovieboxClient
@@ -20,7 +21,12 @@ from bot.db import Database
 from bot.downloader import DownloadManager
 from bot.handlers_admin import router as admin_router
 from bot.handlers_user import router as user_router
-from bot.middlewares import ForceSubscribeMiddleware
+from bot.middlewares import (
+    ApprovalMiddleware,
+    BanMiddleware,
+    ForceSubMiddleware,
+    UserTrackMiddleware,
+)
 
 log = logging.getLogger("akwam-bot")
 
@@ -28,7 +34,7 @@ log = logging.getLogger("akwam-bot")
 def _build_bot() -> Bot:
     default = DefaultBotProperties(parse_mode=ParseMode.HTML)
     if settings.BOT_API_SERVER:
-        # سيرفر Bot API محلي (رفع حد حجم الملفات للإرسال)
+        # Bot API Local Server — رفع ملفات لحد 2GB
         session = AiohttpSession(api=TelegramAPIServer.from_base(settings.BOT_API_SERVER))
         log.info("BOT_API_SERVER مفعّل: %s", settings.BOT_API_SERVER)
         return Bot(settings.BOT_TOKEN, session=session, default=default)
@@ -53,36 +59,48 @@ async def main() -> None:
     cache = TTLCache(ttl_seconds=settings.CACHE_TTL_HOURS * 3600)
     bot = _build_bot()
     downloader = DownloadManager(bot, db, settings.DOWNLOAD_DIR, settings.DEFAULT_MAX_CONCURRENT)
-    await downloader.start()
 
-    dp = Dispatcher(
-        akwam=akwam,
-        starcima=starcima,
-        moviebox=moviebox,
-        cache=cache,
-        downloader=downloader,
-        db=db,
-    )
-    dp.message.middleware(ForceSubscribeMiddleware())
-    dp.callback_query.middleware(ForceSubscribeMiddleware())
-    dp.include_router(admin_router)
+    dp = Dispatcher(storage=MemoryStorage())
+    dp["db"] = db
+    dp["akwam"] = akwam
+    dp["starcima"] = starcima
+    dp["moviebox"] = moviebox
+    dp["cache"] = cache
+    dp["downloader"] = downloader
+
+    # ترتيب الميدل وير: تسجيل → حظر → موافقة الإدارة → اشتراك إجباري
+    dp.message.outer_middleware(UserTrackMiddleware(db))
+    dp.callback_query.outer_middleware(UserTrackMiddleware(db))
+    dp.message.outer_middleware(BanMiddleware(db))
+    dp.callback_query.outer_middleware(BanMiddleware(db))
+    dp.message.outer_middleware(ApprovalMiddleware(db))
+    dp.callback_query.outer_middleware(ApprovalMiddleware(db))
+    dp.message.outer_middleware(ForceSubMiddleware(settings.FORCE_CHANNEL))
+    dp.callback_query.outer_middleware(ForceSubMiddleware(settings.FORCE_CHANNEL))
+
+    dp.include_router(admin_router)  # الأول عشان حالات FSM بتاعته تلتقط رسايله
     dp.include_router(user_router)
 
-    await bot.delete_webhook(drop_pending_updates=True)
-    log.info("البوت بدأ — 3 مواقع: أكوام + ستار سيما + موفي بوكس")
+    me = await bot.get_me()
+    log.info("البوت اشتغل ✅ @%s (id=%s)", me.username, me.id)
+    log.info("دومين أكوام: %s — أدمن: %s", settings.AKWAM_DOMAIN, settings.ADMIN_IDS)
+    log.info("دومين ستار سيما: %s", settings.STARCIMA_DOMAIN)
+    log.info("دومين موفي بوكس: %s", settings.MOVIEBOX_DOMAIN)
+    if settings.FORCE_CHANNEL:
+        log.info("اشتراك إجباري على: %s", settings.FORCE_CHANNEL)
+
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
-        await downloader.stop()
+        log.info("بيقفل… إلغاء التحميلات وقفل الاتصالات")
+        await downloader.shutdown()
         await akwam.close()
         await starcima.close()
         await moviebox.close()
+        await db.close()
         await bot.session.close()
+        log.info("اتقفل نضيف 👋")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        log.info("البوت اتقفل.")
-
+    asyncio.run(main())
