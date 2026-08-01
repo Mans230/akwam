@@ -43,6 +43,20 @@ class DownloadJob:
     referer: str | None = None  # هيدر Referer للمواقع اللي بتطلبه (مثل موفي بوكس)
     dash_url: str | None = None  # رابط MPD احتياطي (موفي بوكس) لو الـ CDN حظر الـ IP
     dash_res: int | None = None  # الدقة المطلوبة من الـ DASH (مطابقة الجودة المختارة)
+    hls_url: str | None = None  # رابط m3u8 احتياطي (موفي بوكس) لو مفيش DASH
+
+
+def _fail_reason(e: Exception) -> str:
+    """رسالة عربية مفهومة لسبب فشل التحميل بدل اسم الاستثناء الغامض."""
+    if isinstance(e, httpx.HTTPStatusError):
+        code = e.response.status_code if e.response is not None else "؟"
+        return (
+            f"السيرفر رفض التحميل ({code}) — غالبًا حظر مؤقت لآي بي Railway على المحتوى ده "
+            "ومفيش مرآة تانية له 😔 جرّب جودة مختلفة، أو دوّر على نفس العنوان في أكوام/ستار سيما."
+        )
+    if isinstance(e, httpx.TransportError):
+        return "حصلت مشكلة اتصال بالشبكة أثناء التحميل — جرب تاني بعد شوية."
+    return f"{type(e).__name__} — جرب تاني."
 
 
 def _fmt_size(n: float) -> str:
@@ -340,7 +354,7 @@ class DownloadManager:
             await self.db.log_download(user_id, job.title, quality, "failed")
             await self._safe_edit(
                 status_msg,
-                f"❌ فشل تحميل «{_esc(job.title)}»\nالسبب: {type(e).__name__} — جرب تاني.",
+                f"❌ فشل تحميل «{_esc(job.title)}»\n{_fail_reason(e)}",
             )
         finally:
             if os.path.exists(path):
@@ -386,15 +400,32 @@ class DownloadManager:
             except asyncio.CancelledError:
                 raise
             except (httpx.HTTPStatusError, httpx.TransportError):
-                if not job.dash_url:
+                # الـ CDN بيحظر آي بيهات الداتاسنتر (403) — جرّب المرايا: DASH ثم HLS
+                if job.dash_url:
+                    log.warning(
+                        "MP4 download failed (%s), trying DASH fallback: %s",
+                        job.url,
+                        job.task_id,
+                    )
+                    try:
+                        await self._download_dash(client, job, path, status_msg)
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if not job.hls_url:
+                            raise
+                        log.exception(
+                            "DASH fallback failed, trying HLS: %s", job.task_id
+                        )
+                if not job.hls_url:
                     raise
-                # الـ CDN بيحظر آي بيهات الداتاسنتر (403) — نجرّب مسار DASH الاحتياطي
                 log.warning(
-                    "MP4 download failed (%s), trying DASH fallback: %s",
+                    "MP4 download failed (%s), trying HLS fallback: %s",
                     job.url,
                     job.task_id,
                 )
-                await self._download_dash(client, job, path, status_msg)
+                await self._download_hls(job, path, status_msg)
 
     async def _probe(self, client: httpx.AsyncClient, url: str) -> tuple[int, bool]:
         """HEAD على الرابط: يرجع (الحجم, هل السيرفر يدعم Range). أي فشل = وضع عادي."""
@@ -657,6 +688,62 @@ class DownloadManager:
                 )
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # ---------- مسار HLS الاحتياطي (موفي بوكس — لما مفيش DASH) ----------
+
+    async def _download_hls(
+        self, job: DownloadJob, path: str, status_msg: Message
+    ) -> None:
+        """تحميل HLS كامل بـ ffmpeg: m3u8 عبر بروكسي الـ API وسجمنتات .ts من sacdn (غير محظور)."""
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("ffmpeg غير مثبت في الصورة")
+        base_cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", job.hls_url, "-c", "copy", "-movflags", "+faststart",
+        ]
+        # سجمنتات .ts صوتها ADTS — محتاجة bsf عشان تتعبّى في mp4؛ لو فشل نجرّب من غيره
+        attempts = [base_cmd + ["-bsf:a", "aac_adtstoasc", path], base_cmd + [path]]
+        last_err = ""
+        for cmd in attempts:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            reporter = asyncio.create_task(self._report_hls(job, path, status_msg))
+            try:
+                _, stderr = await proc.communicate()
+            except asyncio.CancelledError:
+                proc.kill()
+                await proc.wait()
+                raise
+            finally:
+                reporter.cancel()
+                await asyncio.gather(reporter, return_exceptions=True)
+            if proc.returncode == 0 and os.path.exists(path) and os.path.getsize(path) > 0:
+                return
+            last_err = stderr.decode(errors="replace")[:300]
+            log.warning("HLS ffmpeg attempt failed (%s): %s", proc.returncode, last_err)
+        raise RuntimeError(f"ffmpeg HLS فشل: {last_err}")
+
+    async def _report_hls(self, job: DownloadJob, path: str, status_msg: Message) -> None:
+        """تقدم تقريبي لتحميل HLS من نمو حجم الملف على الديسك."""
+        last_edit = time.monotonic()
+        last_bytes = 0
+        while True:
+            await asyncio.sleep(_EDIT_EVERY)
+            size = os.path.getsize(path) if os.path.exists(path) else 0
+            now = time.monotonic()
+            speed = (size - last_bytes) / max(now - last_edit, 0.1) / 1024**2
+            await self._safe_edit(
+                status_msg,
+                f"⬇️ بيتم تحميل «{_esc(job.title)}»\n"
+                f"📊 {_fmt_size(size)} (HLS)\n"
+                f"🚀 {speed:.1f} MB/s",
+                with_kb=job.task_id,
+            )
+            last_edit = now
+            last_bytes = size
 
     async def _report_dash(
         self,
