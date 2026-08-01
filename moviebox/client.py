@@ -400,7 +400,17 @@ class MovieboxClient:
         dash_list = data.get("dash") or []
         if dash_list and isinstance(dash_list[0], dict):
             dash_url = dash_list[0].get("url") or None
-        return MbStreams(qualities=qualities, captions=captions, dash_url=dash_url)
+
+        # مرايا HLS (m3u8 عبر نفس البروكسي — سجمنتات .ts على sacdn غير المحظور)
+        hls_map: dict[int, str] = {}
+        for h in data.get("hls") or []:
+            if not isinstance(h, dict) or h.get("vipLocked"):
+                continue
+            url = h.get("url")
+            res = _int_or_none(h.get("resolutions"))
+            if url and res is not None:
+                hls_map[res] = url
+        return MbStreams(qualities=qualities, captions=captions, dash_url=dash_url, hls_map=hls_map)
 
     async def _fetch_captions(
         self, stream_id: str, subject_id: str, se: int, ep: int
