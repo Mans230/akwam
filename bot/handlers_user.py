@@ -1682,6 +1682,8 @@ async def on_mb_send(
         ),
         thumb_url=ctx.poster,
         referer=VIDEO_REFERER,
+        dash_url=streams.dash_url,
+        dash_res=res_i,
     )
     await downloader.enqueue(callback.from_user.id, callback.message.chat.id, job)
     await db.log_download(
@@ -1932,6 +1934,8 @@ async def on_mb_season_all(
             ),
             thumb_url=ctx.poster or details.poster,
             referer=VIDEO_REFERER,
+            dash_url=streams.dash_url,
+            dash_res=quality.resolution,
         )
         await downloader.enqueue(callback.from_user.id, callback.message.chat.id, job)
         await db.log_download(
