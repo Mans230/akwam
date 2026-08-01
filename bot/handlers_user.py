@@ -1684,6 +1684,7 @@ async def on_mb_send(
         referer=VIDEO_REFERER,
         dash_url=streams.dash_url,
         dash_res=res_i,
+        hls_url=streams.hls_for(res_i),
     )
     await downloader.enqueue(callback.from_user.id, callback.message.chat.id, job)
     await db.log_download(
@@ -1936,6 +1937,7 @@ async def on_mb_season_all(
             referer=VIDEO_REFERER,
             dash_url=streams.dash_url,
             dash_res=quality.resolution,
+            hls_url=streams.hls_for(quality.resolution),
         )
         await downloader.enqueue(callback.from_user.id, callback.message.chat.id, job)
         await db.log_download(
