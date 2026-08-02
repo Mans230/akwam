@@ -254,20 +254,115 @@ def approval_kb(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def admin_kb() -> InlineKeyboardMarkup:
+def admin_kb(maintenance_on: bool = False) -> InlineKeyboardMarkup:
+    """لوحة الأدمن الرئيسية — زر الصيانة بيعكس الحالة الحالية (🟢 شغال / 🔴 متوقف)."""
+    maint_label = "🛠 صيانة: 🔴 متوقف" if maintenance_on else "🛠 صيانة: 🟢 شغال"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="📊 إحصائيات", callback_data=_check_cb("adm:stats")),
-                InlineKeyboardButton(text="📢 إذاعة", callback_data=_check_cb("adm:bc")),
+                InlineKeyboardButton(text="📈 إحصائيات متقدمة", callback_data=_check_cb("adm:adv")),
             ],
             [
-                InlineKeyboardButton(text="👤 إدارة مستخدم", callback_data=_check_cb("adm:user")),
+                InlineKeyboardButton(text="👥 الأعضاء", callback_data=_check_cb("adm:members:all:0")),
+                InlineKeyboardButton(text="👤 بحث عن مستخدم", callback_data=_check_cb("adm:user")),
+            ],
+            [
+                InlineKeyboardButton(text="⏳ طلبات معلقة", callback_data=_check_cb("adm:pend:0")),
                 InlineKeyboardButton(text="🚫 محظورون", callback_data=_check_cb("adm:bans")),
             ],
             [
-                InlineKeyboardButton(text="⏳ طلبات معلقة", callback_data=_check_cb("adm:pending")),
+                InlineKeyboardButton(text="📢 إذاعة", callback_data=_check_cb("adm:bc")),
                 InlineKeyboardButton(text="🌐 المواقع", callback_data=_check_cb("adm:sites")),
+            ],
+            [InlineKeyboardButton(text=maint_label, callback_data=_check_cb("adm:maint"))],
+        ]
+    )
+
+
+def members_kb(
+    users: list[dict], filter: str, offset: int, total: int, per_page: int = 8
+) -> InlineKeyboardMarkup:
+    """شاشة الأعضاء: زر لكل عضو + فلاتر + تقليب (cb='adm:members:{filter}:{offset}')."""
+    builder = InlineKeyboardBuilder()
+    for u in users:
+        name = (u.get("first_name") or "—").strip() or "—"
+        label = name if len(name) <= 18 else name[:17] + "…"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"👤 {label}",
+                callback_data=_check_cb(f"adm:muser:{u['id']}:{filter}:{offset}"),
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(text="الكل", callback_data=_check_cb("adm:members:all:0")),
+        InlineKeyboardButton(text="⭐ بريميوم", callback_data=_check_cb("adm:members:prem:0")),
+        InlineKeyboardButton(text="🚫 محظور", callback_data=_check_cb("adm:members:ban:0")),
+        InlineKeyboardButton(text="⏳ معلق", callback_data=_check_cb("adm:members:pend:0")),
+    )
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        nav.append(
+            InlineKeyboardButton(
+                text="◀️ السابق",
+                callback_data=_check_cb(f"adm:members:{filter}:{max(0, offset - per_page)}"),
+            )
+        )
+    if offset + per_page < total:
+        nav.append(
+            InlineKeyboardButton(
+                text="▶️ التالي",
+                callback_data=_check_cb(f"adm:members:{filter}:{offset + per_page}"),
+            )
+        )
+    if nav:
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(text="🔙 لوحة الأدمن", callback_data=_check_cb("adm:home")))
+    return builder.as_markup()
+
+
+def premium_duration_kb(user_id: int, source: str = "adm") -> InlineKeyboardMarkup:
+    """منتقي مدة البريميوم — source ∈ {'adm', 'acc'} (cb='{src}:premd:{uid}:{days}')."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="7 أيام", callback_data=_check_cb(f"{source}:premd:{user_id}:7")
+                ),
+                InlineKeyboardButton(
+                    text="30 يوم", callback_data=_check_cb(f"{source}:premd:{user_id}:30")
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="90 يوم", callback_data=_check_cb(f"{source}:premd:{user_id}:90")
+                ),
+                InlineKeyboardButton(
+                    text="♾ دائم", callback_data=_check_cb(f"{source}:premd:{user_id}:0")
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ إلغاء", callback_data=_check_cb(f"adm:card:{user_id}")
+                )
+            ],
+        ]
+    )
+
+
+def broadcast_audience_kb() -> InlineKeyboardMarkup:
+    """أزرار جمهور الإذاعة بعد المعاينة (cb='adm:bcgo:{aud}')."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👥 الكل", callback_data=_check_cb("adm:bcgo:all")),
+                InlineKeyboardButton(
+                    text="⭐ البريميوم", callback_data=_check_cb("adm:bcgo:premium")
+                ),
+            ],
+            [
+                InlineKeyboardButton(text="🆓 المجانيين", callback_data=_check_cb("adm:bcgo:free")),
+                InlineKeyboardButton(text="❌ إلغاء", callback_data=_check_cb("adm:bcstop")),
             ],
         ]
     )
@@ -303,7 +398,7 @@ def sites_kb(
 
 
 def user_manage_kb(
-    user_id: int, is_banned: bool, is_premium: bool = False
+    user_id: int, is_banned: bool, is_premium: bool = False, back: str | None = None
 ) -> InlineKeyboardMarkup:
     ban_btn = (
         InlineKeyboardButton(text="✅ فك الحظر", callback_data=_check_cb(f"adm:unban:{user_id}"))
@@ -315,13 +410,15 @@ def user_manage_kb(
         if is_premium
         else InlineKeyboardButton(text="⭐ تفعيل بريميوم", callback_data=_check_cb(f"adm:prem:{user_id}"))
     )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [ban_btn],
-            [prem_btn],
-            [InlineKeyboardButton(text="🔢 تعيين حد التزامن", callback_data=_check_cb(f"adm:lim:{user_id}"))],
-        ]
-    )
+    rows = [
+        [ban_btn],
+        [prem_btn],
+        [InlineKeyboardButton(text="🔢 تعيين حد التزامن", callback_data=_check_cb(f"adm:lim:{user_id}"))],
+        [InlineKeyboardButton(text="✉️ مراسلة", callback_data=_check_cb(f"adm:msg:{user_id}"))],
+    ]
+    if back:
+        rows.append([InlineKeyboardButton(text="🔙 رجوع", callback_data=_check_cb(back))])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---------- ستار سيما (SPEC2 قسم 4) ----------
