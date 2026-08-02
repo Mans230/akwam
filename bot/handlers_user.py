@@ -11,7 +11,9 @@ from uuid import uuid4
 import httpx
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -35,13 +37,16 @@ from .keyboards import (
     mb_details_kb,
     mb_dubs_kb,
     mb_episodes_kb,
+    mb_lang_confirm_kb,
     mb_langs_kb,
     mb_link_kb,
     mb_results_kb,
+    mb_season_all_kb,
     mb_seasons_kb,
     mb_streams_kb,
     mb_trending_kb,
     movie_kb,
+    range_pick_kb,
     sc_akwam_kb,
     sc_dubbed_kb,
     sc_episode_kb,
@@ -63,11 +68,25 @@ from .keyboards import (
     try_akwam_kb,
 )
 from .middlewares import is_subscribed
-from .textutil import CAPTION_LIMIT, MESSAGE_LIMIT, esc as _esc, truncate_html
+from .textutil import (
+    CAPTION_LIMIT,
+    MESSAGE_LIMIT,
+    closest_mb_quality,
+    dub_label,
+    esc as _esc,
+    parse_episode_range,
+    truncate_html,
+)
 
 log = logging.getLogger(__name__)
 
 router = Router()
+
+
+class RangeForm(StatesGroup):
+    """حالة انتظار إدخال رينج الحلقات (تحميل موسم مخصص)."""
+
+    waiting = State()
 
 WELCOME = (
     "أهلاً بيك في <b>بوت أكوام</b> 🍿\n\n"
@@ -334,11 +353,55 @@ async def _get_server_list(
 # ---------- الأوامر والبحث ----------
 
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
     await message.answer(WELCOME)
 
 
-@router.message(F.text, ~F.text.startswith("/"))
+@router.message(RangeForm.waiting, F.text)
+async def on_range_input(
+    message: Message,
+    state: FSMContext,
+    akwam: AkwamClient,
+    starcima: StarcimaClient,
+    moviebox: MovieboxClient,
+    cache: TTLCache,
+    downloader: DownloadManager,
+    db: Database,
+) -> None:
+    """استقبال الرينج المخصص لتحميل الموسم (F2) — قبل on_search عشان المدخل ميتعاملش كبحث."""
+    data = await state.get_data()
+    max_ep = int(data.get("max_ep") or 0)
+    rng = parse_episode_range(message.text or "", max_ep)
+    if rng is None:
+        await message.answer(
+            f"⚠️ الرينج ده مش مفهوم — ابعت رقمين بالشكل ده: <b>3-15</b> "
+            f"(من 1 لـ {max_ep}) أو رقم واحد لحلقة واحدة."
+        )
+        return
+    await state.clear()
+    user_id = message.from_user.id
+    site = data.get("site")
+    if site == "mb":
+        await _mb_season_enqueue(
+            message, user_id, moviebox, cache, downloader, db,
+            data["ckey"], int(data["se"]), int(data["res"]), rng,
+        )
+    elif site == "akwam":
+        await _akwam_season_enqueue(
+            message, user_id, akwam, downloader, db,
+            int(data["sid"]), data["q"], rng,
+        )
+    elif site == "sc":
+        await _sc_season_enqueue(
+            message, user_id, akwam, starcima, cache, downloader, db,
+            int(data["tmdb"]), int(data["season"]), rng,
+        )
+    else:
+        await message.answer("⌛ انتهت صلاحية الطلب ده — اطلب تحميل الموسم تاني.")
+
+
+@router.message(F.text, ~F.text.startswith("/"), StateFilter(None))
 async def on_search(message: Message, cache: TTLCache, db: Database) -> None:
     query = (message.text or "").strip()
     if not query:
@@ -532,6 +595,7 @@ async def on_result(
     starcima: StarcimaClient,
     moviebox: MovieboxClient,
     cache: TTLCache,
+    db: Database,
 ) -> None:
     parts = callback.data.split(":")
     if len(parts) != 3:
@@ -571,7 +635,8 @@ async def on_result(
     result: SearchResult = item
     try:
         if result.type == "movie":
-            await _show_movie(callback, akwam, cache, result.id)
+            premium = await _send_allowed(db, callback.from_user.id)
+            await _show_movie(callback, akwam, cache, result.id, premium)
         else:
             await _show_seasons(callback, akwam, cache, result)
     except NotFoundError:
@@ -582,7 +647,11 @@ async def on_result(
 
 
 async def _show_movie(
-    callback: CallbackQuery, akwam: AkwamClient, cache: TTLCache, movie_id: int
+    callback: CallbackQuery,
+    akwam: AkwamClient,
+    cache: TTLCache,
+    movie_id: int,
+    premium: bool = True,
 ) -> None:
     movie = await akwam.get_movie(movie_id)
     cache.set(f"title:{movie.id}", movie.title)
@@ -598,7 +667,7 @@ async def _show_movie(
         f"💾 الجودات المتاحة: <b>{_esc(quals)}</b>",
         CAPTION_LIMIT,
     )
-    await _respond(callback, caption, movie_kb(movie), photo=movie.poster)
+    await _respond(callback, caption, movie_kb(movie, premium), photo=movie.poster)
 
 
 async def _show_seasons(
@@ -672,7 +741,9 @@ async def on_episodes_page(callback: CallbackQuery, akwam: AkwamClient, cache: T
 
 
 @router.callback_query(F.data.startswith("ep:"))
-async def on_episode(callback: CallbackQuery, akwam: AkwamClient, cache: TTLCache) -> None:
+async def on_episode(
+    callback: CallbackQuery, akwam: AkwamClient, cache: TTLCache, db: Database
+) -> None:
     ep_id = int(callback.data.split(":")[1])
     await callback.answer("⏳ بجيب الحلقة…")
     try:
@@ -688,7 +759,8 @@ async def on_episode(callback: CallbackQuery, akwam: AkwamClient, cache: TTLCach
     quals = ", ".join(q.quality for q in ep.qualities) or "غير متاحة"
     number = f" — الحلقة {ep.number}" if ep.number else ""
     text = f"📺 <b>{_esc(ep.title)}</b>{number}\n\n💾 الجودات المتاحة: <b>{_esc(quals)}</b>"
-    await _respond(callback, text, episode_kb(ep))
+    premium = await _send_allowed(db, callback.from_user.id)
+    await _respond(callback, text, episode_kb(ep, premium))
 
 
 # ---------- تفاصيل ستار سيما ----------
@@ -1049,7 +1121,11 @@ async def on_sc_send(
 
 @router.callback_query(F.data.startswith("sakw:"))
 async def on_sc_akwam(
-    callback: CallbackQuery, akwam: AkwamClient, starcima: StarcimaClient, cache: TTLCache
+    callback: CallbackQuery,
+    akwam: AkwamClient,
+    starcima: StarcimaClient,
+    cache: TTLCache,
+    db: Database,
 ) -> None:
     _, ckey, idx = callback.data.split(":")
     ctx: _SrvCtx | None = cache.get(f"srv:{ckey}")
@@ -1074,9 +1150,10 @@ async def on_sc_akwam(
         return
     cache.set(f"title:{cid}", ctx.display)
     qualities = list(dict.fromkeys(l.quality for l in links))
+    premium = await _send_allowed(db, callback.from_user.id)
     await callback.message.answer(
         f"🎬 جودات أكوام لـ <b>{_esc(ctx.display)}</b> 👇",
-        reply_markup=sc_akwam_kb(fid, cid, qualities),
+        reply_markup=sc_akwam_kb(fid, cid, qualities, premium),
     )
 
 
@@ -1095,28 +1172,120 @@ def _best_direct_link(links: list[DirectLink]) -> DirectLink | None:
 @router.callback_query(F.data.startswith("salls:"))
 async def on_sc_season_all(
     callback: CallbackQuery,
+    starcima: StarcimaClient,
+    cache: TTLCache,
+    db: Database,
+) -> None:
+    """تحميل موسم ستار سيما → شاشة نطاق الحلقات أولاً (F2)."""
+    if not await _send_allowed(db, callback.from_user.id):
+        await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
+        return
+    _, tmdb, season = callback.data.split(":")
+    tmdb_i, season_i = int(tmdb), int(season)
+    await callback.answer()
+    try:
+        eps = await _get_sc_episodes(starcima, cache, tmdb_i, season_i)
+    except Exception:  # noqa: BLE001
+        log.exception("salls prep failed: %s", callback.data)
+        await callback.answer("❌ حصل خطأ، جرب تاني.", show_alert=True)
+        return
+    if not eps:
+        await callback.answer("🙁 الموسم ده مفيهوش حلقات.", show_alert=True)
+        return
+    await callback.message.answer(
+        f"📺 الموسم {season_i} — {len(eps)} حلقة\nاختار نطاق الحلقات 👇",
+        reply_markup=range_pick_kb(
+            f"sallsa:{tmdb_i}:{season_i}", f"sallsr:{tmdb_i}:{season_i}", len(eps)
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("sallsa:"))
+async def on_sc_season_all_confirm(
+    callback: CallbackQuery,
     akwam: AkwamClient,
     starcima: StarcimaClient,
     cache: TTLCache,
     downloader: DownloadManager,
     db: Database,
 ) -> None:
+    """كل الحلقات (ستار سيما)."""
+    if not await _send_allowed(db, callback.from_user.id):
+        await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
+        return
+    _, tmdb, season = callback.data.split(":")
+    await callback.answer("⏳ بجهز حلقات الموسم…")
+    await _sc_season_enqueue(
+        callback.message,
+        callback.from_user.id,
+        akwam,
+        starcima,
+        cache,
+        downloader,
+        db,
+        int(tmdb),
+        int(season),
+        None,
+    )
+
+
+@router.callback_query(F.data.startswith("sallsr:"))
+async def on_sc_season_all_range(
+    callback: CallbackQuery,
+    starcima: StarcimaClient,
+    cache: TTLCache,
+    db: Database,
+    state: FSMContext,
+) -> None:
+    """رينج مخصص (ستار سيما) → FSM."""
     if not await _send_allowed(db, callback.from_user.id):
         await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
         return
     _, tmdb, season = callback.data.split(":")
     tmdb_i, season_i = int(tmdb), int(season)
-    await callback.answer("⏳ بجهز حلقات الموسم…")
-    progress = await callback.message.answer("⏳ بشوف سيرفرات الحلقات وأضيف اللي ينفع للطابور…")
+    try:
+        eps = await _get_sc_episodes(starcima, cache, tmdb_i, season_i)
+    except Exception:  # noqa: BLE001
+        await callback.answer("❌ حصل خطأ، جرب تاني.", show_alert=True)
+        return
+    if not eps:
+        await callback.answer("🙁 الموسم ده مفيهوش حلقات.", show_alert=True)
+        return
+    max_ep = max(e.number for e in eps)
+    await state.set_state(RangeForm.waiting)
+    await state.update_data(site="sc", tmdb=tmdb_i, season=season_i, max_ep=max_ep)
+    await callback.answer()
+    await callback.message.answer(
+        f"✍️ ابعت رينج الحلقات اللي عايزها (مثال: <b>3-15</b> أو رقم واحد) — من 1 لـ {max_ep}:"
+    )
+
+
+async def _sc_season_enqueue(
+    msg: Message,
+    user_id: int,
+    akwam: AkwamClient,
+    starcima: StarcimaClient,
+    cache: TTLCache,
+    downloader: DownloadManager,
+    db: Database,
+    tmdb_i: int,
+    season_i: int,
+    rng: tuple[int, int] | None,
+) -> None:
+    """إضافة حلقات موسم ستار سيما للطابور (كل الحلقات أو رينج)."""
+    progress = await msg.answer("⏳ بشوف سيرفرات الحلقات وأضيف اللي ينفع للطابور…")
     try:
         media = await _get_sc_media(starcima, cache, tmdb_i, "series")
         eps = await _get_sc_episodes(starcima, cache, tmdb_i, season_i)
     except Exception:  # noqa: BLE001
-        log.exception("salls failed: %s", callback.data)
+        log.exception("salls failed: %s/%s", tmdb_i, season_i)
         await progress.edit_text("❌ حصل خطأ وأنا بجهز الموسم، جرب تاني.")
         return
+    if rng is not None:
+        a, b = rng
+        eps = [e for e in eps if a <= e.number <= b]
     if not eps:
-        await progress.edit_text("🙁 الموسم ده مفيهوش حلقات.")
+        await progress.edit_text("🙁 مفيش حلقات في النطاق ده.")
         return
     total = len(eps)
     added = 0
@@ -1169,13 +1338,14 @@ async def on_sc_season_all(
             ),
             thumb_url=ep.thumb or media.poster,
         )
-        await downloader.enqueue(callback.from_user.id, callback.message.chat.id, job)
+        await downloader.enqueue(user_id, msg.chat.id, job)
         await db.log_download(
-            callback.from_user.id, title, provider, "queued", site="starcima"
+            user_id, title, provider, "queued", site="starcima"
         )
         added += 1
+    range_txt = f" (الرينج {rng[0]}-{rng[1]})" if rng else ""
     text = (
-        f"✅ اتضاف <b>{added}</b> من أصل <b>{total}</b> حلقة لطابور التحميل\n"
+        f"✅ اتضاف <b>{added}</b> من أصل <b>{total}</b> حلقة{range_txt} لطابور التحميل\n"
         "الحلقات هتتبعتلك ورا بعض واحدة واحدة 📥"
     )
     if skipped:
@@ -1295,7 +1465,8 @@ async def on_season_all(callback: CallbackQuery, akwam: AkwamClient, db: Databas
     if not first.qualities:
         await callback.answer("🙁 مفيش جودات متاحة للحلقات.", show_alert=True)
         return
-    kb = season_all_kb(series_id, [ql.quality for ql in first.qualities])
+    premium = await _send_allowed(db, callback.from_user.id)
+    kb = season_all_kb(series_id, [ql.quality for ql in first.qualities], premium)
     await callback.message.answer(
         f"📦 <b>{_esc(series.title)}</b> — {len(series.episodes)} حلقة\n"
         "اختار الجودة اللي عايز تحمّل بيها الموسم كله 👇",
@@ -1305,24 +1476,100 @@ async def on_season_all(callback: CallbackQuery, akwam: AkwamClient, db: Databas
 
 @router.callback_query(F.data.startswith("sallq:"))
 async def on_season_all_quality(
-    callback: CallbackQuery,
-    akwam: AkwamClient,
-    downloader: DownloadManager,
-    db: Database,
+    callback: CallbackQuery, akwam: AkwamClient, db: Database
 ) -> None:
+    """بعد اختيار الجودة (أكوام) → شاشة نطاق الحلقات (F2)."""
     if not await _send_allowed(db, callback.from_user.id):
         await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
         return
     _, sid, q = callback.data.split(":", 2)
     series_id = int(sid)
+    await callback.answer()
+    try:
+        series = await akwam.get_series(series_id)
+    except Exception:  # noqa: BLE001
+        log.exception("sallq series failed: %s", series_id)
+        await callback.answer("❌ حصل خطأ، جرب تاني.", show_alert=True)
+        return
+    count = len(series.episodes)
+    if not count:
+        await callback.answer("🙁 المسلسل ده مفيهوش حلقات.", show_alert=True)
+        return
+    await callback.message.answer(
+        f"📺 <b>{_esc(series.title)}</b> — جودة <b>{_esc(q)}</b>\n"
+        "اختار نطاق الحلقات 👇",
+        reply_markup=range_pick_kb(
+            f"sallqa:{series_id}:{q}", f"sallqr:{series_id}:{q}", count
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("sallqa:"))
+async def on_season_all_confirm(
+    callback: CallbackQuery,
+    akwam: AkwamClient,
+    downloader: DownloadManager,
+    db: Database,
+) -> None:
+    """كل الحلقات (أكوام)."""
+    if not await _send_allowed(db, callback.from_user.id):
+        await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
+        return
+    _, sid, q = callback.data.split(":", 2)
     await callback.answer("⏳ بجهز حلقات الموسم…")
-    progress = await callback.message.answer("⏳ بجهز الحلقات وأضيفها للطابور…")
+    await _akwam_season_enqueue(
+        callback.message, callback.from_user.id, akwam, downloader, db, int(sid), q, None
+    )
+
+
+@router.callback_query(F.data.startswith("sallqr:"))
+async def on_season_all_range(
+    callback: CallbackQuery, akwam: AkwamClient, db: Database, state: FSMContext
+) -> None:
+    """رينج مخصص (أكوام) → FSM."""
+    if not await _send_allowed(db, callback.from_user.id):
+        await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
+        return
+    _, sid, q = callback.data.split(":", 2)
+    series_id = int(sid)
+    try:
+        series = await akwam.get_series(series_id)
+    except Exception:  # noqa: BLE001
+        await callback.answer("❌ حصل خطأ، جرب تاني.", show_alert=True)
+        return
+    max_ep = max((e.number or i + 1) for i, e in enumerate(series.episodes))
+    await state.set_state(RangeForm.waiting)
+    await state.update_data(site="akwam", sid=series_id, q=q, max_ep=max_ep)
+    await callback.answer()
+    await callback.message.answer(
+        f"✍️ ابعت رينج الحلقات اللي عايزها (مثال: <b>3-15</b> أو رقم واحد) — من 1 لـ {max_ep}:"
+    )
+
+
+async def _akwam_season_enqueue(
+    msg: Message,
+    user_id: int,
+    akwam: AkwamClient,
+    downloader: DownloadManager,
+    db: Database,
+    series_id: int,
+    q: str,
+    rng: tuple[int, int] | None,
+) -> None:
+    """إضافة حلقات موسم أكوام للطابور (كل الحلقات أو رينج)."""
+    progress = await msg.answer("⏳ بجهز الحلقات وأضيفها للطابور…")
 
     async def _enqueue_all() -> tuple[int, int]:
         series = await akwam.get_series(series_id)
-        total = len(series.episodes)
+        episodes = list(series.episodes)
+        if rng is not None:
+            a, b = rng
+            episodes = [
+                e for i, e in enumerate(episodes) if a <= (e.number or i + 1) <= b
+            ]
+        total = len(episodes)
         added = 0
-        for ep in series.episodes:
+        for ep in episodes:
             try:
                 epd = await akwam.get_episode(ep.id)
                 ql: QualityLink | None = _pick_quality(epd.qualities, q)
@@ -1343,7 +1590,7 @@ async def on_season_all_quality(
                     ),
                     thumb_url=ep.thumb,
                 )
-                await downloader.enqueue(callback.from_user.id, callback.message.chat.id, job)
+                await downloader.enqueue(user_id, msg.chat.id, job)
                 added += 1
             except Exception:  # noqa: BLE001
                 log.exception("sallq episode failed: %s", ep.id)
@@ -1351,12 +1598,14 @@ async def on_season_all_quality(
 
     try:
         added, total = await _enqueue_all()
+        range_txt = f" (الرينج {rng[0]}-{rng[1]})" if rng else ""
         await progress.edit_text(
-            f"✅ اتضاف <b>{added}</b> من أصل <b>{total}</b> حلقة لطابور التحميل بجودة <b>{_esc(q)}</b>\n"
+            f"✅ اتضاف <b>{added}</b> من أصل <b>{total}</b> حلقة{range_txt} "
+            f"لطابور التحميل بجودة <b>{_esc(q)}</b>\n"
             "الحلقات هتتبعتلك ورا بعض واحدة واحدة 📥"
         )
     except Exception:  # noqa: BLE001
-        log.exception("sallq failed: %s", callback.data)
+        log.exception("sallq failed: %s", series_id)
         await progress.edit_text("❌ حصل خطأ وأنا بجهز الموسم، جرب تاني.")
 
 
@@ -1371,6 +1620,7 @@ class _MbCtx:
     title: str
     poster: str | None
     qkey: str | None = None  # مفتاح الاستعلام لزر «جرّب موقع آخر» (فارغ من الرائج)
+    lang_ok: bool = False  # عدّى بوابة اللغة (F1) — اختار/أكّد نسخة
 
 
 def _new_mb_ctx(cache: TTLCache, ctx: _MbCtx) -> str:
@@ -1411,6 +1661,48 @@ def _mb_size(size: int | None) -> str:
     return f"{size / 1024:.0f} KB"
 
 
+def _mb_lang_pref(cache: TTLCache, user_id: int, qkey: str | None) -> str | None:
+    """تفضيل اللغة المحفوظ لنفس البحث (mblang:{user}:{qkey}) — بدون qkey (الرائج) مفيش حفظ."""
+    if not qkey:
+        return None
+    return cache.get(f"mblang:{user_id}:{qkey}")
+
+
+def _mb_save_lang_pref(
+    cache: TTLCache, user_id: int, qkey: str | None, lan_code: str
+) -> None:
+    if qkey and lan_code:
+        cache.set(f"mblang:{user_id}:{qkey}", lan_code.lower())
+
+
+async def _apply_mb_dub(
+    callback: CallbackQuery,
+    moviebox: MovieboxClient,
+    cache: TTLCache,
+    ckey: str,
+    ctx: _MbCtx,
+    dub,
+) -> MbDetails | None:
+    """يبدّل السياق لنسخة معينة ويرجع تفاصيلها (أو None عند الفشل)."""
+    if dub.detail_path == ctx.detail_path:
+        try:
+            return await _get_mb_details(moviebox, cache, ckey, ctx)
+        except Exception:  # noqa: BLE001
+            return None
+    old_sid, old_path = ctx.subject_id, ctx.detail_path
+    ctx.subject_id = dub.subject_id
+    ctx.detail_path = dub.detail_path
+    try:
+        new_details = await moviebox.get_details(dub.detail_path)
+    except Exception:  # noqa: BLE001
+        ctx.subject_id, ctx.detail_path = old_sid, old_path
+        log.exception("apply dub failed: %s", dub.detail_path)
+        return None
+    cache.set(f"mb:{ckey}", ctx)
+    cache.set(f"mbdet:{ckey}", new_details)
+    return new_details
+
+
 async def _show_mb_result(
     callback: CallbackQuery,
     moviebox: MovieboxClient,
@@ -1430,7 +1722,59 @@ async def _show_mb_result(
     ckey = _new_mb_ctx(cache, ctx)
     details = await moviebox.get_details(detail_path)
     cache.set(f"mbdet:{ckey}", details)
+
+    # F1: بوابة اللغة الإجبارية — المستخدم يختار النسخة قبل المواسم/الجودات
+    if await _mb_language_gate(callback, moviebox, cache, ckey, ctx, details):
+        return
+    ctx.lang_ok = True
+    cache.set(f"mb:{ckey}", ctx)
     await _render_mb_details(callback, cache, ckey, ctx, details)
+
+
+async def _mb_language_gate(
+    callback: CallbackQuery,
+    moviebox: MovieboxClient,
+    cache: TTLCache,
+    ckey: str,
+    ctx: _MbCtx,
+    details: MbDetails,
+) -> bool:
+    """بوابة اللغة (F1). ترجع True لو اتعرضت شاشة اختيار/تأكيد ولازم نوقف هنا."""
+    if ctx.lang_ok or not details.dubs:
+        return False
+    pref = _mb_lang_pref(cache, callback.from_user.id, ctx.qkey)
+    if pref:
+        chosen = next(
+            (d for d in details.dubs if (d.lan_code or "").lower() == pref), None
+        )
+        if chosen is not None:
+            applied = await _apply_mb_dub(callback, moviebox, cache, ckey, ctx, chosen)
+            if applied is not None:
+                ctx.lang_ok = True
+                cache.set(f"mb:{ckey}", ctx)
+                await _render_mb_details(callback, cache, ckey, ctx, applied)
+                return True
+    if len(details.dubs) == 1:
+        # نسخة وحيدة → تأكيد بس
+        await _respond(
+            callback,
+            f"🌐 <b>{_esc(details.title)}</b> — 📦 موفي بوكس\n\n"
+            f"النسخة الوحيدة المتاحة: <b>{_esc(dub_label(details.dubs[0]))}</b>\n\n"
+            "كمل بالنسخة دي؟ 👇",
+            mb_lang_confirm_kb(ckey),
+            photo=details.poster or ctx.poster,
+        )
+    else:
+        # أكتر من نسخة → الاختيار إجباري قبل المتابعة
+        await _respond(
+            callback,
+            f"🌐 <b>{_esc(details.title)}</b> — 📦 موفي بوكس\n\n"
+            "⚠️ <b>الخطوة الأولى:</b> اختار اللغة/النسخة اللي هتنزّل بيها "
+            "(هفتكر اختيارك في البحث ده) 👇",
+            mb_dubs_kb(ckey, details.dubs),
+            photo=details.poster or ctx.poster,
+        )
+    return True
 
 
 async def _render_mb_details(
@@ -1481,6 +1825,9 @@ async def on_mb_info(
     except Exception:  # noqa: BLE001
         log.exception("mb details failed: %s", callback.data)
         await callback.answer("❌ حصل خطأ وأنا بجيب التفاصيل، جرب تاني.", show_alert=True)
+        return
+    # F1: لو لسه معدّاش بوابة اللغة، رجّعه ليها
+    if await _mb_language_gate(callback, moviebox, cache, ckey, ctx, details):
         return
     await _render_mb_details(callback, cache, ckey, ctx, details)
 
@@ -1556,6 +1903,7 @@ async def _show_mb_streams(
     ckey: str,
     se: int,
     ep: int,
+    premium: bool = True,
 ) -> None:
     ctx: _MbCtx | None = cache.get(f"mb:{ckey}")
     if ctx is None:
@@ -1616,26 +1964,29 @@ async def _show_mb_streams(
         next_ep=next_ep,
         eps_back_page=eps_back_page,
         site_url=_mb_site_url(ctx),
+        premium=premium,
     )
     await _respond(callback, text, kb, photo=ctx.poster)
 
 
 @router.callback_query(F.data.startswith("mbq:"))
 async def on_mb_qualities(
-    callback: CallbackQuery, moviebox: MovieboxClient, cache: TTLCache
+    callback: CallbackQuery, moviebox: MovieboxClient, cache: TTLCache, db: Database
 ) -> None:
     _, ckey, se, ep = callback.data.split(":")
     await callback.answer("⏳ بجيب الجودات…")
-    await _show_mb_streams(callback, moviebox, cache, ckey, int(se), int(ep))
+    premium = await _send_allowed(db, callback.from_user.id)
+    await _show_mb_streams(callback, moviebox, cache, ckey, int(se), int(ep), premium)
 
 
 @router.callback_query(F.data.startswith("mbep:"))
 async def on_mb_episode(
-    callback: CallbackQuery, moviebox: MovieboxClient, cache: TTLCache
+    callback: CallbackQuery, moviebox: MovieboxClient, cache: TTLCache, db: Database
 ) -> None:
     _, ckey, se, ep = callback.data.split(":")
     await callback.answer("⏳ بجيب الجودات…")
-    await _show_mb_streams(callback, moviebox, cache, ckey, int(se), int(ep))
+    premium = await _send_allowed(db, callback.from_user.id)
+    await _show_mb_streams(callback, moviebox, cache, ckey, int(se), int(ep), premium)
 
 
 # ---------- إرسال / رابط ----------
@@ -1845,30 +2196,52 @@ async def on_mb_dub(
         log.exception("mb dub failed: %s", callback.data)
         await callback.answer("❌ حصل خطأ، جرب تاني.", show_alert=True)
         return
-    ctx.subject_id = dub.subject_id
-    ctx.detail_path = dub.detail_path
+    new_details = await _apply_mb_dub(callback, moviebox, cache, ckey, ctx, dub)
+    if new_details is None:
+        await callback.answer("❌ مقدرتش أفتح النسخة دي، جرب تاني.", show_alert=True)
+        return
+    # F1: حفظ اختيار اللغة لنفس البحث + عدّى البوابة
+    _mb_save_lang_pref(cache, callback.from_user.id, ctx.qkey, dub.lan_code or "")
+    ctx.lang_ok = True
     cache.set(f"mb:{ckey}", ctx)
-    try:
-        new_details = await moviebox.get_details(dub.detail_path)
-    except NotFoundError:
-        await callback.answer("❌ النسخة دي مش موجودة على موفي بوكس.", show_alert=True)
-        return
-    except Exception:  # noqa: BLE001
-        log.exception("mb dub details failed: %s", dub.detail_path)
-        await callback.answer("❌ حصل خطأ وأنا بجيب التفاصيل، جرب تاني.", show_alert=True)
-        return
-    cache.set(f"mbdet:{ckey}", new_details)
     await _render_mb_details(callback, cache, ckey, ctx, new_details)
+
+
+@router.callback_query(F.data.startswith("mblok:"))
+async def on_mb_lang_ok(
+    callback: CallbackQuery, moviebox: MovieboxClient, cache: TTLCache
+) -> None:
+    """تأكيد النسخة الوحيدة (F1) — يطبّقها ويكمل للتفاصيل."""
+    ckey = callback.data.split(":")[1]
+    ctx: _MbCtx | None = cache.get(f"mb:{ckey}")
+    if ctx is None:
+        await callback.answer("⌛ انتهت صلاحية الصفحة دي — ابعت البحث تاني.", show_alert=True)
+        return
+    await callback.answer("⏳ بفتح النسخة…")
+    try:
+        details = await _get_mb_details(moviebox, cache, ckey, ctx)
+    except Exception:  # noqa: BLE001
+        log.exception("mblok details failed: %s", ckey)
+        await callback.answer("❌ حصل خطأ، جرب تاني.", show_alert=True)
+        return
+    if details.dubs:
+        dub = details.dubs[0]
+        applied = await _apply_mb_dub(callback, moviebox, cache, ckey, ctx, dub)
+        if applied is not None:
+            details = applied
+        _mb_save_lang_pref(cache, callback.from_user.id, ctx.qkey, dub.lan_code or "")
+    ctx.lang_ok = True
+    cache.set(f"mb:{ckey}", ctx)
+    await _render_mb_details(callback, cache, ckey, ctx, details)
 
 
 # ---------- تحميل موسم موفي بوكس كامل ----------
 
-def _best_mb_quality(qualities):
-    """أفضل جودة ≤720 متاحة، وإلا الأعلى."""
-    if not qualities:
-        return None
-    le720 = [q for q in qualities if q.resolution <= 720]
-    return max(le720 or qualities, key=lambda q: q.resolution)
+def _mb_season_episodes(season) -> list[int]:
+    """أرقام الحلقات المتاحة في موسم موفي بوكس (مرتبة)."""
+    if season.all_ep is not None:
+        return sorted(season.all_ep)
+    return list(range(1, season.max_ep + 1))
 
 
 @router.callback_query(F.data.startswith("mbsall:"))
@@ -1876,9 +2249,9 @@ async def on_mb_season_all(
     callback: CallbackQuery,
     moviebox: MovieboxClient,
     cache: TTLCache,
-    downloader: DownloadManager,
     db: Database,
 ) -> None:
+    """تحميل موسم موفي بوكس → اختيار الجودة أولاً (F2) من جودات أول حلقة متاحة."""
     if not await _send_allowed(db, callback.from_user.id):
         await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
         return
@@ -1888,39 +2261,201 @@ async def on_mb_season_all(
     if ctx is None:
         await callback.answer("⌛ انتهت صلاحية الصفحة دي — ابعت البحث تاني.", show_alert=True)
         return
-    await callback.answer("⏳ بجهز حلقات الموسم…")
-    progress = await callback.message.answer("⏳ بجيب روابط الحلقات وأضيف اللي ينفع للطابور…")
+    await callback.answer("⏳ بشوف الجودات المتاحة…")
     try:
         details = await _get_mb_details(moviebox, cache, ckey, ctx)
     except Exception:  # noqa: BLE001
         log.exception("mbsall details failed: %s", callback.data)
+        await callback.answer("❌ حصل خطأ وأنا بجهز الموسم، جرب تاني.", show_alert=True)
+        return
+    season = _mb_season_of(details, se_i)
+    if season is None:
+        await callback.answer("🙁 الموسم ده مش موجود.", show_alert=True)
+        return
+    episodes = _mb_season_episodes(season)
+    if not episodes:
+        await callback.answer("🙁 الموسم ده مفيهوش حلقات متاحة.", show_alert=True)
+        return
+    try:
+        streams = await moviebox.get_streams(
+            ctx.subject_id, ctx.detail_path, se=se_i, ep=episodes[0]
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("mbsall first-episode streams failed: %s", callback.data)
+        streams = None
+    if streams is None or not streams.qualities:
+        await callback.answer(
+            "🙁 مقدرتش أجيب جودات الحلقات دلوقتي — جرب تاني بعد شوية.", show_alert=True
+        )
+        return
+    premium = await _send_allowed(db, callback.from_user.id)
+    resolutions = [q.resolution for q in streams.qualities]
+    await callback.message.answer(
+        f"📦 <b>{_esc(ctx.title)}</b> — الموسم {se_i} — {len(episodes)} حلقة\n"
+        "اختار الجودة اللي عايز تحمّل بيها الموسم 👇\n"
+        "<i>(لو جودة ناقصة في حلقة، هنزّل أقرب جودة تلقائيًا)</i>",
+        reply_markup=mb_season_all_kb(ckey, se_i, resolutions, premium),
+    )
+
+
+@router.callback_query(F.data.startswith("mbsallq:"))
+async def on_mb_season_all_quality(
+    callback: CallbackQuery,
+    moviebox: MovieboxClient,
+    cache: TTLCache,
+    db: Database,
+) -> None:
+    """بعد اختيار الجودة (موفي بوكس) → شاشة نطاق الحلقات (F2)."""
+    if not await _send_allowed(db, callback.from_user.id):
+        await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
+        return
+    _, ckey, se, res = callback.data.split(":")
+    se_i, res_i = int(se), int(res)
+    ctx: _MbCtx | None = cache.get(f"mb:{ckey}")
+    if ctx is None:
+        await callback.answer("⌛ انتهت صلاحية الصفحة دي — ابعت البحث تاني.", show_alert=True)
+        return
+    await callback.answer()
+    try:
+        details = await _get_mb_details(moviebox, cache, ckey, ctx)
+    except Exception:  # noqa: BLE001
+        await callback.answer("❌ حصل خطأ، جرب تاني.", show_alert=True)
+        return
+    season = _mb_season_of(details, se_i)
+    if season is None:
+        await callback.answer("🙁 الموسم ده مش موجود.", show_alert=True)
+        return
+    count = len(_mb_season_episodes(season))
+    await callback.message.answer(
+        f"📺 <b>{_esc(ctx.title)}</b> — الموسم {se_i} بجودة <b>{res_i}p</b>\n"
+        "اختار نطاق الحلقات 👇",
+        reply_markup=range_pick_kb(
+            f"mbsalla:{ckey}:{se_i}:{res_i}",
+            f"mbsallr:{ckey}:{se_i}:{res_i}",
+            count,
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("mbsalla:"))
+async def on_mb_season_all_confirm(
+    callback: CallbackQuery,
+    moviebox: MovieboxClient,
+    cache: TTLCache,
+    downloader: DownloadManager,
+    db: Database,
+) -> None:
+    """كل الحلقات (موفي بوكس)."""
+    if not await _send_allowed(db, callback.from_user.id):
+        await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
+        return
+    _, ckey, se, res = callback.data.split(":")
+    await callback.answer("⏳ بجهز حلقات الموسم…")
+    await _mb_season_enqueue(
+        callback.message,
+        callback.from_user.id,
+        moviebox,
+        cache,
+        downloader,
+        db,
+        ckey,
+        int(se),
+        int(res),
+        None,
+    )
+
+
+@router.callback_query(F.data.startswith("mbsallr:"))
+async def on_mb_season_all_range(
+    callback: CallbackQuery,
+    moviebox: MovieboxClient,
+    cache: TTLCache,
+    db: Database,
+    state: FSMContext,
+) -> None:
+    """رينج مخصص (موفي بوكس) → FSM."""
+    if not await _send_allowed(db, callback.from_user.id):
+        await callback.answer(PREMIUM_ONLY_MSG, show_alert=True)
+        return
+    _, ckey, se, res = callback.data.split(":")
+    se_i, res_i = int(se), int(res)
+    ctx: _MbCtx | None = cache.get(f"mb:{ckey}")
+    if ctx is None:
+        await callback.answer("⌛ انتهت صلاحية الصفحة دي — ابعت البحث تاني.", show_alert=True)
+        return
+    try:
+        details = await _get_mb_details(moviebox, cache, ckey, ctx)
+    except Exception:  # noqa: BLE001
+        await callback.answer("❌ حصل خطأ، جرب تاني.", show_alert=True)
+        return
+    season = _mb_season_of(details, se_i)
+    if season is None:
+        await callback.answer("🙁 الموسم ده مش موجود.", show_alert=True)
+        return
+    episodes = _mb_season_episodes(season)
+    if not episodes:
+        await callback.answer("🙁 الموسم ده مفيهوش حلقات متاحة.", show_alert=True)
+        return
+    await state.set_state(RangeForm.waiting)
+    await state.update_data(
+        site="mb", ckey=ckey, se=se_i, res=res_i, max_ep=max(episodes)
+    )
+    await callback.answer()
+    await callback.message.answer(
+        f"✍️ ابعت رينج الحلقات اللي عايزها (مثال: <b>3-15</b> أو رقم واحد) — "
+        f"من {min(episodes)} لـ {max(episodes)}:"
+    )
+
+
+async def _mb_season_enqueue(
+    msg: Message,
+    user_id: int,
+    moviebox: MovieboxClient,
+    cache: TTLCache,
+    downloader: DownloadManager,
+    db: Database,
+    ckey: str,
+    se_i: int,
+    res: int,
+    rng: tuple[int, int] | None,
+) -> None:
+    """إضافة حلقات موسم موفي بوكس للطابور بالجودة المختارة (أو أقرب جودة ليها)."""
+    ctx: _MbCtx | None = cache.get(f"mb:{ckey}")
+    if ctx is None:
+        await msg.answer("⌛ انتهت صلاحية الصفحة دي — ابعت البحث تاني.")
+        return
+    progress = await msg.answer("⏳ بجيب روابط الحلقات وأضيف اللي ينفع للطابور…")
+    try:
+        details = await _get_mb_details(moviebox, cache, ckey, ctx)
+    except Exception:  # noqa: BLE001
+        log.exception("mbsall details failed: %s/%s", ckey, se_i)
         await progress.edit_text("❌ حصل خطأ وأنا بجهز الموسم، جرب تاني.")
         return
     season = _mb_season_of(details, se_i)
     if season is None:
         await progress.edit_text("🙁 الموسم ده مش موجود.")
         return
-    episodes = (
-        sorted(season.all_ep)
-        if season.all_ep is not None
-        else list(range(1, season.max_ep + 1))
-    )
+    episodes = _mb_season_episodes(season)
+    if rng is not None:
+        a, b = rng
+        episodes = [n for n in episodes if a <= n <= b]
     if not episodes:
-        await progress.edit_text("🙁 الموسم ده مفيهوش حلقات متاحة.")
+        await progress.edit_text("🙁 مفيش حلقات في النطاق ده.")
         return
     total = len(episodes)
     added = 0
     skipped: list[int] = []
     for num in episodes:
         quality = None
+        streams = None
         try:
             streams = await moviebox.get_streams(
                 ctx.subject_id, ctx.detail_path, se=se_i, ep=num
             )
-            quality = _best_mb_quality(streams.qualities)
+            quality = closest_mb_quality(streams.qualities, res)
         except Exception:  # noqa: BLE001
             log.exception("mbsall episode failed: %s/%s", se_i, num)
-        if quality is None:
+        if quality is None or streams is None:
             skipped.append(num)
             continue
         display = f"{ctx.title} — الموسم {se_i} الحلقة {num}"
@@ -1939,17 +2474,19 @@ async def on_mb_season_all(
             dash_res=quality.resolution,
             hls_url=streams.hls_for(quality.resolution),
         )
-        await downloader.enqueue(callback.from_user.id, callback.message.chat.id, job)
+        await downloader.enqueue(user_id, msg.chat.id, job)
         await db.log_download(
-            callback.from_user.id,
+            user_id,
             title,
             f"{quality.resolution}p",
             "queued",
             site="moviebox",
         )
         added += 1
+    range_txt = f" (الرينج {rng[0]}-{rng[1]})" if rng else ""
     text = (
-        f"✅ اتضاف <b>{added}</b> من أصل <b>{total}</b> حلقة لطابور التحميل\n"
+        f"✅ اتضاف <b>{added}</b> من أصل <b>{total}</b> حلقة{range_txt} "
+        f"لطابور التحميل بجودة <b>{res}p</b>\n"
         "الحلقات هتتبعتلك ورا بعض واحدة واحدة 📥"
     )
     if skipped:
@@ -2015,6 +2552,14 @@ async def on_close(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "noop")
 async def on_noop(callback: CallbackQuery) -> None:
     await callback.answer()
+
+
+@router.callback_query(F.data == "locked1080")
+async def on_locked1080(callback: CallbackQuery) -> None:
+    await callback.answer(
+        "🔒 جودة 1080p متاحة للمشتركين البريميوم بس ⭐ — اختار جودة أقل أو اطلب الترقية من الإدارة.",
+        show_alert=True,
+    )
 
 
 @router.callback_query(F.data == "checksub")
