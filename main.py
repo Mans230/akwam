@@ -25,10 +25,36 @@ from bot.middlewares import (
     ApprovalMiddleware,
     BanMiddleware,
     ForceSubMiddleware,
+    MaintenanceMiddleware,
     UserTrackMiddleware,
 )
 
 log = logging.getLogger("akwam-bot")
+
+
+async def _premium_sweeper(bot: Bot, db: Database) -> None:
+    """مهمة دورية: إنهاء البريميوم المنتهي وإبلاغ المستخدم والأدمن (كل 30 دقيقة)."""
+    while True:
+        try:
+            for uid in await db.list_expired_premium():
+                await db.expire_premium(uid)
+                try:
+                    await bot.send_message(
+                        uid, "⌛ انتهت مدة البريميوم بتاعتك — تجدد بالتواصل مع الإدارة."
+                    )
+                except Exception:  # noqa: BLE001
+                    log.exception("premium-expiry notify user %s failed", uid)
+                for admin_id in settings.ADMIN_IDS:
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"⌛ بريميوم المستخدم <code>{uid}</code> انتهى تلقائيًا.",
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception("premium-expiry notify admin %s failed", admin_id)
+        except Exception:  # noqa: BLE001
+            log.exception("premium sweeper iteration failed")
+        await asyncio.sleep(1800)  # كل 30 دقيقة
 
 
 def _build_bot() -> Bot:
@@ -68,11 +94,13 @@ async def main() -> None:
     dp["cache"] = cache
     dp["downloader"] = downloader
 
-    # ترتيب الميدل وير: تسجيل → حظر → موافقة الإدارة → اشتراك إجباري
+    # ترتيب الميدل وير: تسجيل → حظر → صيانة → موافقة الإدارة → اشتراك إجباري
     dp.message.outer_middleware(UserTrackMiddleware(db))
     dp.callback_query.outer_middleware(UserTrackMiddleware(db))
     dp.message.outer_middleware(BanMiddleware(db))
     dp.callback_query.outer_middleware(BanMiddleware(db))
+    dp.message.outer_middleware(MaintenanceMiddleware(db))
+    dp.callback_query.outer_middleware(MaintenanceMiddleware(db))
     dp.message.outer_middleware(ApprovalMiddleware(db))
     dp.callback_query.outer_middleware(ApprovalMiddleware(db))
     dp.message.outer_middleware(ForceSubMiddleware(settings.FORCE_CHANNEL))
@@ -89,9 +117,12 @@ async def main() -> None:
     if settings.FORCE_CHANNEL:
         log.info("اشتراك إجباري على: %s", settings.FORCE_CHANNEL)
 
+    sweeper = asyncio.create_task(_premium_sweeper(bot, db))
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        sweeper.cancel()
+        await asyncio.gather(sweeper, return_exceptions=True)
         log.info("بيقفل… إلغاء التحميلات وقفل الاتصالات")
         await downloader.shutdown()
         await akwam.close()

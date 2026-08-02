@@ -74,6 +74,33 @@ class BanMiddleware(BaseMiddleware):
         return None
 
 
+class MaintenanceMiddleware(BaseMiddleware):
+    """وضع الصيانة — لما مفتاح maintenance=1 في الإعدادات، أي حد غير الأدمن يتصدى له.
+
+    الأدمن يعدّي دايمًا، وعند أي استثناء في فحص الإعداد → fail-open (نسمح بالمرور).
+    """
+
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    async def __call__(self, handler: Handler, event: TelegramObject, data: dict[str, Any]) -> Any:
+        user = data.get("event_from_user")
+        if user is not None and user.id in settings.ADMIN_IDS:
+            return await handler(event, data)
+        try:
+            maintenance = (await self.db.get_setting("maintenance", "0")) == "1"
+        except Exception:  # noqa: BLE001
+            log.exception("maintenance check failed — السماح بالمرور")
+            maintenance = False
+        if not maintenance:
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery):
+            await event.answer("🛠 البوت تحت الصيانة حاليًا.", show_alert=True)
+        elif isinstance(event, Message):
+            await event.answer("🛠 البوت تحت الصيانة حاليًا — جرّب تاني بعد شوية 🙏")
+        return None
+
+
 class ApprovalMiddleware(BaseMiddleware):
     """موافقة الإدارة قبل الاستخدام — شغالة بس لو REQUIRE_APPROVAL مفعّل.
 
