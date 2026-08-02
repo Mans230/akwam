@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS users (
     is_banned INTEGER DEFAULT 0,
     max_concurrent INTEGER NULL,
     is_approved INTEGER DEFAULT 0,
-    is_premium INTEGER DEFAULT 0
+    is_premium INTEGER DEFAULT 0,
+    premium_until TEXT NULL
 );
 CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -61,6 +62,8 @@ class Database:
             await self._conn.execute("ALTER TABLE users ADD COLUMN is_approved INTEGER DEFAULT 0")
         if "is_premium" not in cols:
             await self._conn.execute("ALTER TABLE users ADD COLUMN is_premium INTEGER DEFAULT 0")
+        if "premium_until" not in cols:
+            await self._conn.execute("ALTER TABLE users ADD COLUMN premium_until TEXT NULL")
         # migration آمن: عمود site في requests/downloads للقواعد القديمة
         for table in ("requests", "downloads"):
             cur = await self._conn.execute(f"PRAGMA table_info({table})")
@@ -89,7 +92,25 @@ class Database:
         await cur.close()
         return row[0] if row else None
 
-    _USER_COLS = "id, username, first_name, is_banned, max_concurrent, is_approved, is_premium"
+    _USER_COLS = (
+        "id, username, first_name, is_banned, max_concurrent, is_approved, "
+        "is_premium, premium_until, joined_at"
+    )
+
+    # فلاتر قوائم الأعضاء (list_users/count_users)
+    _USER_FILTERS = {
+        "all": "",
+        "premium": "WHERE is_premium = 1",
+        "banned": "WHERE is_banned = 1",
+        "pending": "WHERE is_approved = 0 AND is_banned = 0",
+    }
+
+    @classmethod
+    def _filter_where(cls, filter: str) -> str:
+        try:
+            return cls._USER_FILTERS[filter]
+        except KeyError:
+            raise ValueError(f"فلتر أعضاء غير معروف: {filter!r}") from None
 
     @staticmethod
     def _user_dict(r: tuple, downloads: int = 0) -> dict:
@@ -101,6 +122,8 @@ class Database:
             "max_concurrent": r[4],
             "is_approved": bool(r[5]),
             "is_premium": bool(r[6]),
+            "premium_until": r[7],
+            "joined_at": r[8],
             "downloads": downloads,
         }
 
@@ -148,7 +171,7 @@ class Database:
         await cur.close()
         if row is None:
             return None
-        return self._user_dict(row, downloads=row[7] or 0)
+        return self._user_dict(row, downloads=row[9] or 0)
 
     async def is_approved(self, user_id: int) -> bool:
         val = await self._scalar("SELECT is_approved FROM users WHERE id = ?", (user_id,))
@@ -163,26 +186,150 @@ class Database:
         await self.conn.commit()
 
     async def is_premium(self, user_id: int) -> bool:
-        val = await self._scalar("SELECT is_premium FROM users WHERE id = ?", (user_id,))
+        """بريميوم ساري: is_premium=1 و(بدون انتهاء أو لسه في المدة)."""
+        val = await self._scalar(
+            "SELECT is_premium FROM users WHERE id = ? "
+            "AND (premium_until IS NULL OR premium_until > datetime('now','localtime'))",
+            (user_id,),
+        )
         return bool(val)
 
-    async def set_premium(self, user_id: int, premium: bool) -> None:
+    async def set_premium(self, user_id: int, premium: bool, days: int | None = None) -> None:
+        """تفعيل/إلغاء البريميوم. days=None يعني دائم، غير كده بمدة بالأيام."""
+        if premium and days is not None:
+            await self.conn.execute(
+                "INSERT INTO users (id, is_premium, premium_until) "
+                "VALUES (?, 1, datetime('now','localtime', ?)) "
+                "ON CONFLICT(id) DO UPDATE SET is_premium=1, "
+                "premium_until=datetime('now','localtime', ?)",
+                (user_id, f"+{days} days", f"+{days} days"),
+            )
+        else:
+            await self.conn.execute(
+                "INSERT INTO users (id, is_premium, premium_until) VALUES (?, ?, NULL) "
+                "ON CONFLICT(id) DO UPDATE SET is_premium=excluded.is_premium, premium_until=NULL",
+                (user_id, int(premium)),
+            )
+        await self.conn.commit()
+
+    async def list_expired_premium(self) -> list[int]:
+        """ids المستخدمين البريميوم المنتهي (بمدة وخلصت)."""
+        cur = await self.conn.execute(
+            "SELECT id FROM users WHERE is_premium = 1 AND premium_until IS NOT NULL "
+            "AND premium_until <= datetime('now','localtime')"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [r[0] for r in rows]
+
+    async def expire_premium(self, user_id: int) -> None:
+        """إنهاء بريميوم مستخدم (بعد انتهاء المدة)."""
         await self.conn.execute(
-            "INSERT INTO users (id, is_premium) VALUES (?, ?) "
-            "ON CONFLICT(id) DO UPDATE SET is_premium=excluded.is_premium",
-            (user_id, int(premium)),
+            "UPDATE users SET is_premium = 0, premium_until = NULL WHERE id = ?",
+            (user_id,),
         )
         await self.conn.commit()
 
-    async def list_pending(self) -> list[dict]:
+    async def list_pending(self, offset: int = 0, limit: int = 10) -> list[dict]:
         """المستخدمون المعلقون: غير موافق عليهم وغير محظورين (مرفوضين)."""
         cur = await self.conn.execute(
             f"SELECT {self._USER_COLS} FROM users "
-            "WHERE is_approved = 0 AND is_banned = 0 ORDER BY joined_at DESC LIMIT 50"
+            "WHERE is_approved = 0 AND is_banned = 0 "
+            "ORDER BY joined_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
         )
         rows = await cur.fetchall()
         await cur.close()
         return [self._user_dict(r) for r in rows]
+
+    async def count_pending(self) -> int:
+        """عدد المعلقين (غير موافق عليهم وغير محظورين)."""
+        return (
+            await self._scalar(
+                "SELECT COUNT(*) FROM users WHERE is_approved = 0 AND is_banned = 0"
+            )
+            or 0
+        )
+
+    async def list_users(self, filter: str = "all", offset: int = 0, limit: int = 8) -> list[dict]:
+        """قايمة الأعضاء بفلتر (all/premium/banned/pending) مع تقليب وعدد التحميلات."""
+        where = self._filter_where(filter)
+        cur = await self.conn.execute(
+            f"SELECT {self._USER_COLS}, "
+            "(SELECT COUNT(*) FROM downloads WHERE downloads.user_id = users.id) "
+            f"FROM users {where} ORDER BY joined_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [self._user_dict(r, downloads=r[9] or 0) for r in rows]
+
+    async def count_users(self, filter: str = "all") -> int:
+        """عدد الأعضاء حسب الفلتر (all/premium/banned/pending)."""
+        where = self._filter_where(filter)
+        return await self._scalar(f"SELECT COUNT(*) FROM users {where}") or 0
+
+    async def top_users(self, limit: int = 10) -> list[dict]:
+        """أكثر المستخدمين تحميلًا (كل الحالات) — باستبعاد اللي عددهم 0."""
+        cur = await self.conn.execute(
+            "SELECT users.id, users.username, users.first_name, COUNT(downloads.id) AS dl "
+            "FROM users JOIN downloads ON downloads.user_id = users.id "
+            "GROUP BY users.id ORDER BY dl DESC, users.id LIMIT ?",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [
+            {"id": r[0], "username": r[1], "first_name": r[2], "downloads": r[3]}
+            for r in rows
+        ]
+
+    async def recent_downloads(self, limit: int = 20) -> list[dict]:
+        """آخر التحميلات مع بيانات المستخدم (الأحدث أولًا)."""
+        cur = await self.conn.execute(
+            "SELECT d.user_id, u.username, u.first_name, d.title, d.quality, d.status, "
+            "d.site, d.created_at "
+            "FROM downloads d LEFT JOIN users u ON u.id = d.user_id "
+            "ORDER BY d.created_at DESC, d.id DESC LIMIT ?",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [
+            {
+                "user_id": r[0],
+                "username": r[1],
+                "first_name": r[2],
+                "title": r[3],
+                "quality": r[4],
+                "status": r[5],
+                "site": r[6],
+                "created_at": r[7],
+            }
+            for r in rows
+        ]
+
+    async def count_new_users(self, days: int) -> int:
+        """عدد الأعضاء اللي انضموا في آخر N يوم."""
+        return (
+            await self._scalar(
+                "SELECT COUNT(*) FROM users "
+                "WHERE joined_at >= datetime('now','localtime', '-' || ? || ' days')",
+                (days,),
+            )
+            or 0
+        )
+
+    async def top_titles(self, limit: int = 10) -> list[tuple[str, int]]:
+        """أكثر العناوين تحميلًا ناجحًا (عنوان، عدد)."""
+        cur = await self.conn.execute(
+            "SELECT title, COUNT(*) FROM downloads WHERE status = 'done' "
+            "GROUP BY title ORDER BY COUNT(*) DESC, title LIMIT ?",
+            (limit,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [(r[0], r[1]) for r in rows]
 
     async def log_request(self, user_id: int, query: str, site: str = "akwam") -> None:
         await self.conn.execute(
@@ -247,8 +394,21 @@ class Database:
             or 0,
         }
 
-    async def all_user_ids(self) -> list[int]:
-        cur = await self.conn.execute("SELECT id FROM users")
+    async def all_user_ids(self, audience: str = "all") -> list[int]:
+        """ids للإذاعة: all (الكل) / premium (ساري) / free (مش بريميوم أو منتهي)."""
+        active_prem = (
+            "is_premium = 1 AND (premium_until IS NULL "
+            "OR premium_until > datetime('now','localtime'))"
+        )
+        if audience == "premium":
+            sql = f"SELECT id FROM users WHERE {active_prem}"
+        elif audience == "free":
+            sql = f"SELECT id FROM users WHERE NOT ({active_prem})"
+        elif audience == "all":
+            sql = "SELECT id FROM users"
+        else:
+            raise ValueError(f"جمهور إذاعة غير معروف: {audience!r}")
+        cur = await self.conn.execute(sql)
         rows = await cur.fetchall()
         await cur.close()
         return [r[0] for r in rows]
@@ -270,7 +430,7 @@ class Database:
             )
         rows = await cur.fetchall()
         await cur.close()
-        return [self._user_dict(r, downloads=r[7] or 0) for r in rows]
+        return [self._user_dict(r, downloads=r[9] or 0) for r in rows]
 
     async def list_banned(self) -> list[dict]:
         cur = await self.conn.execute(
