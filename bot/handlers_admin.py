@@ -14,7 +14,14 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from .config import settings
 from .db import Database
 from .downloader import DownloadManager
-from .keyboards import admin_kb, sites_kb, user_manage_kb
+from .keyboards import (
+    admin_kb,
+    broadcast_audience_kb,
+    members_kb,
+    premium_duration_kb,
+    sites_kb,
+    user_manage_kb,
+)
 from .textutil import MESSAGE_LIMIT, esc as _esc, truncate_html
 
 log = logging.getLogger(__name__)
@@ -24,6 +31,18 @@ router.message.filter(F.from_user.id.in_(settings.ADMIN_IDS))
 router.callback_query.filter(F.from_user.id.in_(settings.ADMIN_IDS))
 
 BC_DELAY = 0.05
+MEMBERS_PER_PAGE = 8
+PENDING_PER_PAGE = 10
+
+# فلاتر شاشة الأعضاء: قصيرة للـ 64 بايت → (فلتر db, الاسم المعروض)
+_MEMBERS_FILTERS = {
+    "all": ("all", "الكل"),
+    "prem": ("premium", "⭐ بريميوم"),
+    "ban": ("banned", "🚫 محظور"),
+    "pend": ("pending", "⏳ معلق"),
+}
+
+_AUDIENCE_NAMES = {"all": "الكل", "premium": "البريميوم", "free": "المجانيين"}
 
 
 class AdminStates(StatesGroup):
@@ -31,13 +50,30 @@ class AdminStates(StatesGroup):
     broadcast_confirm = State()
     user_search = State()
     set_limit = State()
+    dm_user = State()
+
+
+async def _maint_on(db: Database) -> bool:
+    return (await db.get_setting("maintenance", "0")) == "1"
+
+
+def _dur_label(days: int) -> str:
+    if days == 0:
+        return "♾ دائم"
+    if days == 7:
+        return "7 أيام"
+    return f"{days} يوم"
 
 
 def _user_card(u: dict) -> str:
     username = f"@{u['username']}" if u.get("username") else "—"
     name = u.get("first_name") or "—"
     approval = "✅ موافق عليه" if u.get("is_approved") else "⏳ معلق"
-    premium = "⭐ نعم" if u.get("is_premium") else "لا"
+    if u.get("is_premium"):
+        until = u.get("premium_until")
+        premium = f"⭐ لحد {_esc(str(until))}" if until else "⭐ دائم"
+    else:
+        premium = "لا"
     status = "🚫 محظور" if u.get("is_banned") else "✅ نشط"
     limit = u.get("max_concurrent") if u.get("max_concurrent") is not None else "افتراضي"
     return (
@@ -47,24 +83,28 @@ def _user_card(u: dict) -> str:
         f"بريميوم: {premium}\n"
         f"الحالة: {status}\n"
         f"حد التزامن: {limit}\n"
-        f"عدد التحميلات: {u.get('downloads', 0)}"
+        f"عدد التحميلات: {u.get('downloads', 0)}\n"
+        f"📅 انضم: {_esc(str(u.get('joined_at') or '—'))}"
     )
 
 
 # ---------- الدخول للوحة ----------
 
 @router.message(Command("admin"))
-async def cmd_admin(message: Message, state: FSMContext) -> None:
+async def cmd_admin(message: Message, state: FSMContext, db: Database) -> None:
     await state.clear()
-    await message.answer("🛠 <b>لوحة تحكم الأدمن</b>\nاختار من تحت 👇", reply_markup=admin_kb())
+    await message.answer(
+        "🛠 <b>لوحة تحكم الأدمن</b>\nاختار من تحت 👇",
+        reply_markup=admin_kb(await _maint_on(db)),
+    )
 
 
 @router.message(Command("cancel"), StateFilter("*"))
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
+async def cmd_cancel(message: Message, state: FSMContext, db: Database) -> None:
     if await state.get_state() is None:
         return
     await state.clear()
-    await message.answer("❌ اتلغت العملية.", reply_markup=admin_kb())
+    await message.answer("❌ اتلغت العملية.", reply_markup=admin_kb(await _maint_on(db)))
 
 
 # ---------- الإحصائيات ----------
@@ -98,9 +138,157 @@ async def adm_stats(callback: CallbackQuery, db: Database, downloader: DownloadM
         f"📦 موفي بوكس — طلبات: <b>{requests_mb}</b> | تحميلات: <b>{downloads_mb}</b>"
     )
     try:
-        await callback.message.edit_text(text, reply_markup=admin_kb())
+        await callback.message.edit_text(text, reply_markup=admin_kb(await _maint_on(db)))
     except TelegramBadRequest:
-        await callback.message.answer(text, reply_markup=admin_kb())
+        await callback.message.answer(text, reply_markup=admin_kb(await _maint_on(db)))
+    await callback.answer()
+
+
+# ---------- الإحصائيات المتقدمة ----------
+
+_DL_STATUS_ICONS = {"done": "✅", "failed": "❌", "cancelled": "🚫"}
+
+
+@router.callback_query(F.data == "adm:adv")
+async def adm_adv(callback: CallbackQuery, db: Database) -> None:
+    new_today = await db.count_new_users(1)
+    new_week = await db.count_new_users(7)
+    top = await db.top_users(10)
+    titles = await db.top_titles(10)
+    recent = await db.recent_downloads(20)
+
+    lines = [
+        "📈 <b>إحصائيات متقدمة</b>",
+        "",
+        f"🆕 <b>أعضاء جدد:</b> النهاردة: <b>{new_today}</b> — آخر 7 أيام: <b>{new_week}</b>",
+        "",
+        "🏆 <b>توب 10 مستخدمين تحميلًا:</b>",
+    ]
+    if top:
+        for i, u in enumerate(top, 1):
+            name = _esc(str(u.get("first_name") or "—"))
+            username = f"@{u['username']}" if u.get("username") else "—"
+            lines.append(f"  {i}. {name} ({_esc(username)}) — {u.get('downloads', 0)} تحميل")
+    else:
+        lines.append("  — لسه مفيش تحميلات")
+    lines += ["", "🎬 <b>أكثر العناوين تحميلًا:</b>"]
+    if titles:
+        for i, (title, count) in enumerate(titles, 1):
+            lines.append(f"  {i}. {_esc(str(title))} — {count}")
+    else:
+        lines.append("  — لسه مفيش")
+    lines += ["", "🕒 <b>آخر 20 تحميل:</b>"]
+    if recent:
+        for d in recent:
+            icon = _DL_STATUS_ICONS.get(d.get("status") or "", "❔")
+            title = _esc(str(d.get("title") or "—"))
+            quality = _esc(str(d.get("quality") or "—"))
+            uname = _esc(str(d.get("first_name") or d.get("username") or d.get("user_id") or "—"))
+            site = _SITE_NAMES.get(d.get("site") or "", d.get("site") or "—")
+            lines.append(
+                f"  • {icon} {title} ({quality}) — {uname} — {site} — "
+                f"{_esc(str(d.get('created_at') or '—'))}"
+            )
+    else:
+        lines.append("  — لسه مفيش")
+
+    text = truncate_html("\n".join(lines), MESSAGE_LIMIT)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 لوحة الأدمن", callback_data="adm:home")]
+        ]
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+# ---------- شاشة الأعضاء ----------
+
+def _member_icon(u: dict) -> str:
+    if u.get("is_banned"):
+        return "🚫"
+    if u.get("is_premium"):
+        return "⭐"
+    if not u.get("is_approved"):
+        return "⏳"
+    return ""
+
+
+async def _render_members(callback: CallbackQuery, db: Database, flt: str, offset: int) -> None:
+    db_filter, filter_name = _MEMBERS_FILTERS[flt]
+    total = await db.count_users(db_filter)
+    users = await db.list_users(db_filter, offset, MEMBERS_PER_PAGE)
+    if not users:
+        text = f"👥 <b>الأعضاء — {filter_name} ({total})</b>\n\nمفيش أعضاء هنا."
+    else:
+        lines = [f"👥 <b>الأعضاء — {filter_name} ({total})</b>\n"]
+        for u in users:
+            name = _esc(str(u.get("first_name") or "—"))
+            username = f"@{u['username']}" if u.get("username") else "—"
+            icon = _member_icon(u)
+            suffix = f" {icon}" if icon else ""
+            lines.append(f"• {name} ({_esc(username)}) — 🆔 <code>{u['id']}</code>{suffix}")
+        text = truncate_html("\n".join(lines), MESSAGE_LIMIT)
+    kb = members_kb(users, flt, offset, total, MEMBERS_PER_PAGE)
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await callback.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("adm:members:"))
+async def adm_members(callback: CallbackQuery, db: Database) -> None:
+    parts = callback.data.split(":")
+    flt = parts[2] if len(parts) > 2 and parts[2] in _MEMBERS_FILTERS else "all"
+    try:
+        offset = max(0, int(parts[3]))
+    except (IndexError, ValueError):
+        offset = 0
+    await _render_members(callback, db, flt, offset)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:muser:"))
+async def adm_member_card(callback: CallbackQuery, db: Database) -> None:
+    parts = callback.data.split(":")
+    uid = int(parts[2])
+    flt = parts[3] if len(parts) > 3 and parts[3] in _MEMBERS_FILTERS else "all"
+    try:
+        offset = max(0, int(parts[4]))
+    except (IndexError, ValueError):
+        offset = 0
+    u = await db.get_user(uid)
+    text = _user_card(u) if u else f"🆔 <code>{uid}</code>\n(المستخدم مش متسجل)"
+    kb = user_manage_kb(
+        uid,
+        u["is_banned"] if u else False,
+        u.get("is_premium", False) if u else False,
+        back=f"adm:members:{flt}:{offset}",
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await callback.message.answer(text, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:card:"))
+async def adm_card(callback: CallbackQuery, db: Database) -> None:
+    uid = int(callback.data.split(":")[2])
+    u = await db.get_user(uid)
+    text = _user_card(u) if u else f"🆔 <code>{uid}</code>\n(المستخدم مش متسجل)"
+    kb = user_manage_kb(
+        uid,
+        u["is_banned"] if u else False,
+        u.get("is_premium", False) if u else False,
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        await callback.message.answer(text, reply_markup=kb)
     await callback.answer()
 
 
@@ -169,28 +357,27 @@ async def adm_broadcast_start(callback: CallbackQuery, state: FSMContext) -> Non
 async def adm_broadcast_preview(message: Message, state: FSMContext) -> None:
     await state.update_data(chat_id=message.chat.id, message_id=message.message_id)
     await state.set_state(AdminStates.broadcast_confirm)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ إرسال للكل", callback_data="adm:bcgo"),
-                InlineKeyboardButton(text="❌ إلغاء", callback_data="adm:bcstop"),
-            ]
-        ]
+    await message.answer(
+        "👆 دي الرسالة اللي هتتبعت. اختار الجمهور 👇",
+        reply_markup=broadcast_audience_kb(),
     )
-    await message.answer("👆 دي الرسالة اللي هتتبعت. متأكد؟", reply_markup=kb)
 
 
 @router.callback_query(F.data == "adm:bcstop", StateFilter("*"))
-async def adm_broadcast_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+async def adm_broadcast_cancel(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
     await state.clear()
-    await callback.message.edit_text("❌ اتلغت الإذاعة.", reply_markup=admin_kb())
+    await callback.message.edit_text(
+        "❌ اتلغت الإذاعة.", reply_markup=admin_kb(await _maint_on(db))
+    )
     await callback.answer()
 
 
-@router.callback_query(F.data == "adm:bcgo")
+@router.callback_query(F.data.startswith("adm:bcgo"))
 async def adm_broadcast_send(
     callback: CallbackQuery, state: FSMContext, db: Database
 ) -> None:
+    parts = callback.data.split(":")
+    aud = parts[2] if len(parts) > 2 and parts[2] in _AUDIENCE_NAMES else "all"
     data = await state.get_data()
     await state.clear()
     chat_id = data.get("chat_id")
@@ -198,8 +385,10 @@ async def adm_broadcast_send(
     if not chat_id or not message_id:
         await callback.answer("⚠️ الرسالة ضاعت، ابعتها تاني.", show_alert=True)
         return
-    users = await db.all_user_ids()
-    status = await callback.message.edit_text(f"📢 بيبعت لـ {len(users)} مستخدم…")
+    users = await db.all_user_ids(aud)
+    status = await callback.message.edit_text(
+        f"📢 بيبعت لـ {len(users)} مستخدم ({_AUDIENCE_NAMES[aud]})…"
+    )
     ok = failed = 0
     for uid in users:
         try:
@@ -220,7 +409,7 @@ async def adm_broadcast_send(
         await asyncio.sleep(BC_DELAY)
     await status.edit_text(
         f"📢 <b>الإذاعة خلصت</b>\n\n✅ نجح: <b>{ok}</b>\n❌ فشل: <b>{failed}</b>",
-        reply_markup=admin_kb(),
+        reply_markup=admin_kb(await _maint_on(db)),
     )
     await callback.answer()
 
@@ -279,10 +468,24 @@ async def adm_unban(callback: CallbackQuery, db: Database) -> None:
 
 
 @router.callback_query(F.data.startswith("adm:prem:"))
-async def adm_prem(callback: CallbackQuery, db: Database) -> None:
+async def adm_prem(callback: CallbackQuery) -> None:
     uid = int(callback.data.split(":")[2])
-    await db.set_premium(uid, True)
-    await callback.answer("⭐ اتفعّل البريميوم.")
+    try:
+        await callback.message.edit_text(
+            f"⭐ اختار مدة البريميوم للمستخدم <code>{uid}</code>:",
+            reply_markup=premium_duration_kb(uid, "adm"),
+        )
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:premd:"))
+async def adm_premd(callback: CallbackQuery, db: Database) -> None:
+    parts = callback.data.split(":")
+    uid, days = int(parts[2]), int(parts[3])
+    await db.set_premium(uid, True, days or None)
+    await callback.answer(f"⭐ اتفعّل البريميوم ({_dur_label(days)}).")
     await _refresh_card(callback, db, uid)
 
 
@@ -335,7 +538,58 @@ async def adm_limit_set(message: Message, state: FSMContext, db: Database) -> No
         txt = f"✅ المستخدم <code>{target}</code> رجع للحد الافتراضي."
     else:
         txt = f"✅ حد التزامن للمستخدم <code>{target}</code> بقى <b>{n}</b>."
-    await message.answer(txt, reply_markup=admin_kb())
+    await message.answer(txt, reply_markup=admin_kb(await _maint_on(db)))
+
+
+# ---------- مراسلة مستخدم ✉️ ----------
+
+@router.callback_query(F.data.startswith("adm:msg:"))
+async def adm_msg_start(callback: CallbackQuery, state: FSMContext) -> None:
+    uid = int(callback.data.split(":")[2])
+    await state.set_state(AdminStates.dm_user)
+    await state.update_data(target=uid)
+    await callback.message.answer(
+        f"✉️ ابعت الرسالة اللي عايز توصلها للمستخدم <code>{uid}</code>.\n(أو /cancel للإلغاء)"
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.dm_user)
+async def adm_msg_send(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    target = data.get("target")
+    await state.clear()
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("⚠️ الرسالة فاضية — اتلغت.")
+        return
+    try:
+        await message.bot.send_message(
+            target, f"📩 <b>رسالة من الإدارة:</b>\n\n{_esc(text)}"
+        )
+    except TelegramForbiddenError:
+        await message.answer("❌ مقدرتش أوصل — المستخدم حظر البوت")
+        return
+    except Exception:  # noqa: BLE001
+        log.exception("dm to user %s failed", target)
+        await message.answer("❌ حصل خطأ أثناء الإرسال.")
+        return
+    await message.answer(f"✅ اتبعتت الرسالة للمستخدم <code>{target}</code>.")
+
+
+# ---------- وضع الصيانة ----------
+
+@router.callback_query(F.data == "adm:maint")
+async def adm_maint(callback: CallbackQuery, db: Database) -> None:
+    new_on = not await _maint_on(db)
+    await db.set_setting("maintenance", "1" if new_on else "0")
+    await callback.answer("🔴 وضع الصيانة اتفعّل" if new_on else "🟢 وضع الصيانة اتقفل")
+    try:
+        await callback.message.edit_text(
+            "🛠 <b>لوحة تحكم الأدمن</b>\nاختار من تحت 👇", reply_markup=admin_kb(new_on)
+        )
+    except TelegramBadRequest:
+        pass
 
 
 # ---------- المحظورون ----------
@@ -352,39 +606,36 @@ async def adm_bans(callback: CallbackQuery, db: Database) -> None:
             lines.append(f"• <code>{u['id']}</code> — {_esc(u.get('first_name') or '')} ({_esc(username)})")
         text = truncate_html("\n".join(lines), MESSAGE_LIMIT)
     try:
-        await callback.message.edit_text(text, reply_markup=admin_kb())
+        await callback.message.edit_text(text, reply_markup=admin_kb(await _maint_on(db)))
     except TelegramBadRequest:
-        await callback.message.answer(text, reply_markup=admin_kb())
+        await callback.message.answer(text, reply_markup=admin_kb(await _maint_on(db)))
     await callback.answer()
 
 
 # ---------- طلبات الانضمام المعلقة ----------
 
 @router.callback_query(F.data == "adm:home")
-async def adm_home(callback: CallbackQuery) -> None:
+async def adm_home(callback: CallbackQuery, db: Database) -> None:
     try:
         await callback.message.edit_text(
-            "🛠 <b>لوحة تحكم الأدمن</b>\nاختار من تحت 👇", reply_markup=admin_kb()
+            "🛠 <b>لوحة تحكم الأدمن</b>\nاختار من تحت 👇",
+            reply_markup=admin_kb(await _maint_on(db)),
         )
     except TelegramBadRequest:
         pass
     await callback.answer()
 
 
-@router.callback_query(F.data == "adm:pending")
-async def adm_pending(callback: CallbackQuery, db: Database) -> None:
-    pending = await db.list_pending()
+async def _render_pending(callback: CallbackQuery, db: Database, offset: int) -> None:
+    total = await db.count_pending()
+    pending = await db.list_pending(offset, PENDING_PER_PAGE)
     if not pending:
-        text = "⏳ مفيش طلبات معلقة 🎉"
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 لوحة الأدمن", callback_data="adm:home")]
-            ]
-        )
-    else:
-        lines = [f"⏳ <b>طلبات معلقة ({len(pending)})</b>\n"]
+        text = f"⏳ <b>طلبات معلقة ({total})</b>\n\nمفيش طلبات هنا 🎉" if total else "⏳ مفيش طلبات معلقة 🎉"
         buttons: list[list[InlineKeyboardButton]] = []
-        for u in pending[:10]:
+    else:
+        lines = [f"⏳ <b>طلبات معلقة ({total})</b>\n"]
+        buttons = []
+        for u in pending:
             name = _esc(str(u.get("first_name") or "—"))
             username = f"@{u['username']}" if u.get("username") else "—"
             lines.append(f"• <code>{u['id']}</code> — {name} ({_esc(username)})")
@@ -396,13 +647,43 @@ async def adm_pending(callback: CallbackQuery, db: Database) -> None:
                     InlineKeyboardButton(text="❌", callback_data=f"acc:no:{u['id']}"),
                 ]
             )
-        buttons.append([InlineKeyboardButton(text="🔙 لوحة الأدمن", callback_data="adm:home")])
         text = truncate_html("\n".join(lines), MESSAGE_LIMIT)
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        nav.append(
+            InlineKeyboardButton(
+                text="◀️ السابق",
+                callback_data=f"adm:pend:{max(0, offset - PENDING_PER_PAGE)}",
+            )
+        )
+    if offset + PENDING_PER_PAGE < total:
+        nav.append(
+            InlineKeyboardButton(text="▶️ التالي", callback_data=f"adm:pend:{offset + PENDING_PER_PAGE}")
+        )
+    if nav:
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton(text="🔙 لوحة الأدمن", callback_data="adm:home")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     try:
         await callback.message.edit_text(text, reply_markup=kb)
     except TelegramBadRequest:
         await callback.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "adm:pending")
+async def adm_pending_legacy(callback: CallbackQuery, db: Database) -> None:
+    """اسم بديل قديم — يرد بنفس شاشة adm:pend:0 عشان مفيش زر قديم يكسر."""
+    await _render_pending(callback, db, 0)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm:pend:"))
+async def adm_pending(callback: CallbackQuery, db: Database) -> None:
+    try:
+        offset = max(0, int(callback.data.split(":")[2]))
+    except (IndexError, ValueError):
+        offset = 0
+    await _render_pending(callback, db, offset)
     await callback.answer()
 
 
@@ -435,20 +716,36 @@ async def acc_ok(callback: CallbackQuery, db: Database) -> None:
 
 
 @router.callback_query(F.data.startswith("acc:prem:"))
-async def acc_prem(callback: CallbackQuery, db: Database) -> None:
+async def acc_prem(callback: CallbackQuery) -> None:
     uid = int(callback.data.split(":")[2])
+    try:
+        await callback.message.edit_text(
+            f"⭐ اختار مدة البريميوم للمستخدم <code>{uid}</code>:",
+            reply_markup=premium_duration_kb(uid, "acc"),
+        )
+    except TelegramBadRequest:
+        pass
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("acc:premd:"))
+async def acc_premd(callback: CallbackQuery, db: Database) -> None:
+    parts = callback.data.split(":")
+    uid, days = int(parts[2]), int(parts[3])
+    dur = _dur_label(days)
     await db.set_approved(uid, True)
-    await db.set_premium(uid, True)
+    await db.set_premium(uid, True, days or None)
     await _notify_user(
         callback,
         uid,
         "🎉 تمت الموافقة وحسابك بقى <b>بريميوم ⭐</b>\n\n"
         "مميزاتك:\n"
         "• ⬇️ إرسال الأفلام والحلقات مباشرة هنا على تليجرام\n"
-        f"• ⚡ تحميل أسرع ({settings.PREMIUM_SEGMENTS} قطعة متوازية)\n\n"
+        f"• ⚡ تحميل أسرع ({settings.PREMIUM_SEGMENTS} قطعة متوازية)\n"
+        f"• ⌛ مدة الصلاحية: {dur}\n\n"
         "ابعت اسم أي فيلم أو مسلسل 👇",
     )
-    await _edit_decision(callback, uid, "⭐ موافقة + بريميوم")
+    await _edit_decision(callback, uid, f"⭐ موافقة + بريميوم ({dur})")
     await callback.answer("⭐ موافقة + بريميوم.")
 
 
