@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import logging
+import math
 import os
 import re
 import shutil
@@ -31,6 +33,7 @@ _MIN_PARALLEL_SIZE = 10 * 1024**2  # التحميل المتوازي للملف�
 _SEGMENT_RETRIES = 3  # محاولات لكل قطعة قبل الرجوع للتدفق الواحد
 _DASH_CONCURRENCY = 10  # تحميلات سجمنتات DASH المتزامنة
 _DASH_RETRIES = 3  # محاولات لكل سجمنت DASH
+_SPLIT_THRESHOLD = 1990 * 1024**2  # ~2GB بهامش أمان — فوقه يتقسّم لأجزاء (F5)
 
 
 @dataclass
@@ -44,6 +47,7 @@ class DownloadJob:
     dash_url: str | None = None  # رابط MPD احتياطي (موفي بوكس) لو الـ CDN حظر الـ IP
     dash_res: int | None = None  # الدقة المطلوبة من الـ DASH (مطابقة الجودة المختارة)
     hls_url: str | None = None  # رابط m3u8 احتياطي (موفي بوكس) لو مفيش DASH
+    waited: bool = False  # اتملى في الطابور — عشان رسالة «جه دورك» عند البدء (F4)
 
 
 def _fail_reason(e: Exception) -> str:
@@ -231,6 +235,7 @@ class DownloadManager:
         busy = self.active_count(user_id)
         waiting = queue.qsize()
         if busy >= limit or waiting:
+            job.waited = True
             await self.bot.send_message(
                 chat_id,
                 f"📥 «{_esc(job.title)}» في طابور الانتظار (رقم {waiting + 1}) — "
@@ -335,14 +340,22 @@ class DownloadManager:
         path = os.path.join(self.download_dir, f"{job.task_id}.mp4")
         status_msg: Message | None = None
         try:
+            start_txt = (
+                f"🚀 جه دورك! بدأ تحميل «{_esc(job.title)}»…"
+                if job.waited
+                else f"⏳ بدأ تحميل «{_esc(job.title)}»…"
+            )
             status_msg = await self.bot.send_message(
                 chat_id,
-                f"⏳ بدأ تحميل «{_esc(job.title)}»…",
+                start_txt,
                 reply_markup=cancel_kb(job.task_id),
             )
             segments, premium = await self._segments_for(user_id)
             await self._download_file(job, path, status_msg, segments=segments, premium=premium)
-            await self._upload_file(job, path, chat_id, status_msg)
+            if os.path.getsize(path) > _SPLIT_THRESHOLD:
+                await self._split_and_upload(job, path, chat_id, status_msg)
+            else:
+                await self._upload_file(job, path, chat_id, status_msg)
             await self.db.log_download(user_id, job.title, quality, "done")
             await self._safe_edit(status_msg, f"✅ خلص واتبعت: «{_esc(job.title)}»")
         except asyncio.CancelledError:
@@ -360,6 +373,11 @@ class DownloadManager:
             if os.path.exists(path):
                 try:
                     os.remove(path)
+                except OSError:
+                    pass
+            for part in glob.glob(f"{path}.seg*.mp4"):
+                try:
+                    os.remove(part)
                 except OSError:
                     pass
 
@@ -772,11 +790,18 @@ class DownloadManager:
             last_bytes = done_bytes[0]
 
     async def _upload_file(
-        self, job: DownloadJob, path: str, chat_id: int, status_msg: Message
+        self,
+        job: DownloadJob,
+        path: str,
+        chat_id: int,
+        status_msg: Message,
+        caption: str | None = None,
+        label: str | None = None,
     ) -> None:
+        display = label or job.title
         await self._safe_edit(
             status_msg,
-            f"📤 بيترفع على تليجرام: «{_esc(job.title)}»\n(ممكن ياخد وقت حسب حجم الملف)",
+            f"📤 بيترفع على تليجرام: «{_esc(display)}»\n(ممكن ياخد وقت حسب حجم الملف)",
             with_kb=job.task_id,
         )
         started = time.monotonic()
@@ -790,7 +815,7 @@ class DownloadManager:
                     elapsed = int(time.monotonic() - started)
                     await self._safe_edit(
                         status_msg,
-                        f"📤 بيترفع على تليجرام: «{_esc(job.title)}»\n⏱ مر {elapsed} ثانية…",
+                        f"📤 بيترفع على تليجرام: «{_esc(display)}»\n⏱ مر {elapsed} ثانية…",
                         with_kb=job.task_id,
                     )
 
@@ -800,7 +825,7 @@ class DownloadManager:
             await self.bot.send_video(
                 chat_id,
                 FSInputFile(path),
-                caption=truncate_html(job.caption, CAPTION_LIMIT),
+                caption=truncate_html(caption if caption is not None else job.caption, CAPTION_LIMIT),
                 supports_streaming=True,
                 thumbnail=thumbnail,
             )
@@ -808,6 +833,78 @@ class DownloadManager:
             stop.set()
             ticker.cancel()
             await asyncio.gather(ticker, return_exceptions=True)
+
+    # ---------- تقسيم الملفات الأكبر من 2GB (F5) ----------
+
+    async def _probe_duration(self, path: str) -> float:
+        """مدة الفيديو بالثواني من ffprobe (0 لو مقدرناش)."""
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        try:
+            return float(out.decode().strip())
+        except ValueError:
+            return 0.0
+
+    async def _split_and_upload(
+        self, job: DownloadJob, path: str, chat_id: int, status_msg: Message
+    ) -> None:
+        """تقسيم ملف >2GB بـ ffmpeg segment muxer (بدون إعادة ترميز) ورفع الأجزاء ورا بعض."""
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError("الملف أكبر من 2 جيجا و ffmpeg مش متاح للتقسيم")
+        size = os.path.getsize(path)
+        n_parts = math.ceil(size / _SPLIT_THRESHOLD)
+        duration = await self._probe_duration(path)
+        if duration <= 0:
+            raise RuntimeError("مقدرتش أحدد مدة الفيديو عشان أقسّمه")
+        seg_time = max(1, math.ceil(duration / n_parts))
+        pattern = f"{path}.seg%03d.mp4"
+        await self._safe_edit(
+            status_msg,
+            f"✂️ «{_esc(job.title)}» أكبر من 2 جيجا — بيتم تقسيمه لـ {n_parts} جزء…",
+        )
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", path, "-c", "copy", "-map", "0",
+            "-f", "segment", "-segment_time", str(seg_time),
+            "-reset_timestamps", "1", pattern,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            proc.kill()
+            await proc.wait()
+            raise
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg تقسيم فشل ({proc.returncode}): {stderr.decode(errors='replace')[:300]}"
+            )
+        parts = sorted(glob.glob(f"{path}.seg*.mp4"))
+        if not parts:
+            raise RuntimeError("التقسيم مانتجش أجزاء")
+        try:
+            for i, part in enumerate(parts, 1):
+                await self._upload_file(
+                    job,
+                    part,
+                    chat_id,
+                    status_msg,
+                    caption=f"{job.caption}\n📦 الجزء {i}/{len(parts)}",
+                    label=f"{job.title} — الجزء {i}/{len(parts)}",
+                )
+        finally:
+            for part in parts:
+                if os.path.exists(part):
+                    try:
+                        os.remove(part)
+                    except OSError:
+                        pass
 
     async def _safe_edit(
         self, msg: Message | None, text: str, with_kb: str | None = None
