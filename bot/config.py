@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     TG_API_HASH: str = ""
     DEFAULT_MAX_CONCURRENT: int = 1
     DOWNLOAD_SEGMENTS: int = 8
-    REQUIRE_APPROVAL: bool = False
+    REQUIRE_APPROVAL: bool = True
     PREMIUM_SEGMENTS: int = 16
     CACHE_TTL_HOURS: int = 6
     EPISODES_PER_PAGE: int = 20
