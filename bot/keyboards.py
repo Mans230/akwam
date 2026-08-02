@@ -8,6 +8,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from akwam.models import Episode, EpisodeDetails, MovieDetails, SearchResult
 
+from .textutil import dub_label
+
 if TYPE_CHECKING:
     from starcima import ScEpisode, ScSeason, ServerLink
 
@@ -24,6 +26,14 @@ def _check_cb(data: str) -> str:
 def _q_token(quality: str) -> str:
     """توكين قصير للجودة جوّه الـ callback (≤ 8 حروف)."""
     return quality[:8]
+
+
+def _hd_locked(quality: str, premium: bool) -> bool:
+    """1080p فأعلى مقفولة لغير البريميوم (F3)."""
+    if premium:
+        return False
+    num = "".join(ch for ch in quality if ch.isdigit())
+    return bool(num) and int(num) >= 1080
 
 
 def search_results_kb(
@@ -44,7 +54,21 @@ def search_results_kb(
     return builder.as_markup()
 
 
-def _quality_rows(builder: InlineKeyboardBuilder, file_id: int, content_id: int, quality: str) -> None:
+def _quality_rows(
+    builder: InlineKeyboardBuilder,
+    file_id: int,
+    content_id: int,
+    quality: str,
+    premium: bool = True,
+) -> None:
+    if _hd_locked(quality, premium):
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🔒 {quality} — بريميوم ⭐",
+                callback_data=_check_cb("locked1080"),
+            )
+        )
+        return
     q = _q_token(quality)
     builder.row(
         InlineKeyboardButton(
@@ -58,10 +82,10 @@ def _quality_rows(builder: InlineKeyboardBuilder, file_id: int, content_id: int,
     )
 
 
-def movie_kb(movie: MovieDetails) -> InlineKeyboardMarkup:
+def movie_kb(movie: MovieDetails, premium: bool = True) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for ql in movie.qualities:
-        _quality_rows(builder, ql.file_id, ql.content_id, ql.quality)
+        _quality_rows(builder, ql.file_id, ql.content_id, ql.quality, premium)
     if movie.qualities:
         first = movie.qualities[0]
         builder.row(
@@ -119,10 +143,10 @@ def series_kb(
     return builder.as_markup()
 
 
-def episode_kb(ep: EpisodeDetails) -> InlineKeyboardMarkup:
+def episode_kb(ep: EpisodeDetails, premium: bool = True) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for ql in ep.qualities:
-        _quality_rows(builder, ql.file_id, ql.content_id, ql.quality)
+        _quality_rows(builder, ql.file_id, ql.content_id, ql.quality, premium)
     if ep.qualities:
         first = ep.qualities[0]
         builder.row(
@@ -151,16 +175,44 @@ def episode_kb(ep: EpisodeDetails) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def season_all_kb(series_id: int, qualities: list[str]) -> InlineKeyboardMarkup:
-    """أزرار اختيار جودة تحميل الموسم كامل cb='sallq:{series_id}:{q}'."""
+def season_all_kb(
+    series_id: int, qualities: list[str], premium: bool = True
+) -> InlineKeyboardMarkup:
+    """أزرار اختيار جودة تحميل الموسم كامل cb='sallq:{series_id}:{q}' — 1080 مقفولة لغير البريميوم."""
     builder = InlineKeyboardBuilder()
     for q in qualities:
+        if _hd_locked(q, premium):
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"🔒 الموسم كامل {q} — بريميوم ⭐",
+                    callback_data=_check_cb("locked1080"),
+                )
+            )
+            continue
         builder.row(
             InlineKeyboardButton(
                 text=f"⬇️ الموسم كامل {q} ⭐",
                 callback_data=_check_cb(f"sallq:{series_id}:{_q_token(q)}"),
             )
         )
+    return builder.as_markup()
+
+
+def range_pick_kb(all_cb: str, custom_cb: str, count: int) -> InlineKeyboardMarkup:
+    """شاشة اختيار نطاق الحلقات: كل الحلقات أو رينج مخصص (FSM)."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text=f"📦 كل الحلقات ({count})",
+            callback_data=_check_cb(all_cb),
+        )
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="✍️ رينج مخصص (مثال: 3-15)",
+            callback_data=_check_cb(custom_cb),
+        )
+    )
     return builder.as_markup()
 
 
@@ -554,11 +606,13 @@ def sc_fail_kb(embed_url: str) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def sc_akwam_kb(file_id: int, content_id: int, qualities: list[str]) -> InlineKeyboardMarkup:
+def sc_akwam_kb(
+    file_id: int, content_id: int, qualities: list[str], premium: bool = True
+) -> InlineKeyboardMarkup:
     """جودات أكوام الحقيقية لسيرفر akwam داخل ستار سيما."""
     builder = InlineKeyboardBuilder()
     for q in qualities:
-        _quality_rows(builder, file_id, content_id, q)
+        _quality_rows(builder, file_id, content_id, q, premium)
     builder.row(
         InlineKeyboardButton(
             text="👁 مشاهدة أونلاين", callback_data=_check_cb(f"watch:{file_id}:{content_id}")
@@ -773,10 +827,19 @@ def mb_streams_kb(
     next_ep: int | None = None,
     eps_back_page: int = 1,
     site_url: str | None = None,
+    premium: bool = True,
 ) -> InlineKeyboardMarkup:
     """شاشة الجودات: لكل جودة إرسال ⭐ + رابط، ترجمة عربية، لغات أخرى، تنقل حلقات."""
     builder = InlineKeyboardBuilder()
     for res, size_label in qualities:
+        if not premium and res >= 1080:
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"🔒 {res}p — {size_label} — بريميوم ⭐",
+                    callback_data=_check_cb("locked1080"),
+                )
+            )
+            continue
         builder.row(
             InlineKeyboardButton(
                 text=f"⬇️ إرسال {res}p ⭐",
@@ -845,16 +908,49 @@ def mb_link_kb(url: str) -> InlineKeyboardMarkup:
 
 
 def mb_dubs_kb(ckey: str, dubs: list[MbDub]) -> InlineKeyboardMarkup:
-    """قائمة النسخ والدبلجات (cb='mbd:{ckey}:{i}') — 🎧 أصلي / 🇪🇬 عربي."""
+    """قائمة النسخ والدبلجات (cb='mbd:{ckey}:{i}') — بالصيغتين: عربي + اسم الموقع."""
     builder = InlineKeyboardBuilder()
     for i, d in enumerate(dubs):
-        icon = "🎧" if d.original else ("🇪🇬" if "ar" in (d.lan_code or "").lower() else "🌐")
-        kind = "مترجم مدمج" if d.type == 1 else "دبلجة"
-        label = f"{icon} {d.name} — {kind}"
-        if len(label) > 40:
-            label = label[:37] + "…"
         builder.row(
-            InlineKeyboardButton(text=label, callback_data=_check_cb(f"mbd:{ckey}:{i}"))
+            InlineKeyboardButton(text=dub_label(d), callback_data=_check_cb(f"mbd:{ckey}:{i}"))
+        )
+    builder.row(
+        InlineKeyboardButton(text="🔙 التفاصيل", callback_data=_check_cb(f"mbi:{ckey}"))
+    )
+    return builder.as_markup()
+
+
+def mb_lang_confirm_kb(ckey: str) -> InlineKeyboardMarkup:
+    """تأكيد النسخة الوحيدة المتاحة (cb='mblok:{ckey}')."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="✅ متابعة بالنسخة دي", callback_data=_check_cb(f"mblok:{ckey}")
+        )
+    )
+    builder.row(InlineKeyboardButton(text="🔙 رجوع للنتايج", callback_data=_check_cb("back")))
+    return builder.as_markup()
+
+
+def mb_season_all_kb(
+    ckey: str, se: int, resolutions: list[int], premium: bool = True
+) -> InlineKeyboardMarkup:
+    """اختيار جودة تحميل موسم موفي بوكس (cb='mbsallq:{ckey}:{se}:{res}') — 1080 مقفولة لغير البريميوم."""
+    builder = InlineKeyboardBuilder()
+    for res in resolutions:
+        if not premium and res >= 1080:
+            builder.row(
+                InlineKeyboardButton(
+                    text=f"🔒 الموسم كامل {res}p — بريميوم ⭐",
+                    callback_data=_check_cb("locked1080"),
+                )
+            )
+            continue
+        builder.row(
+            InlineKeyboardButton(
+                text=f"⬇️ الموسم كامل {res}p ⭐",
+                callback_data=_check_cb(f"mbsallq:{ckey}:{se}:{res}"),
+            )
         )
     builder.row(
         InlineKeyboardButton(text="🔙 التفاصيل", callback_data=_check_cb(f"mbi:{ckey}"))
