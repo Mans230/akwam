@@ -391,6 +391,36 @@ class DownloadManager:
     ) -> None:
         if segments is None:
             segments = self.segments
+        try:
+            await self._download_with_client(
+                job, path, status_msg, segments, premium, verify=True
+            )
+        except asyncio.CancelledError:
+            raise
+        except httpx.ConnectError as exc:
+            # بعض الـ CDNs (زي downet.net بتاع روابط أكوام) بيبعت سلسلة شهادات
+            # ناقصة، فيفشل تحقق TLS رغم إن الرابط نفسه شغال — نعيد المحاولة
+            # مرة واحدة بدون تحقق بدل ما التحميل كله يفشل.
+            if "CERTIFICATE_VERIFY_FAILED" not in str(exc):
+                raise
+            log.warning(
+                "SSL certificate verify failed for %s — retrying with verify=False (%s)",
+                job.url,
+                job.task_id,
+            )
+            await self._download_with_client(
+                job, path, status_msg, segments, premium, verify=False
+            )
+
+    async def _download_with_client(
+        self,
+        job: DownloadJob,
+        path: str,
+        status_msg: Message,
+        segments: int,
+        premium: bool,
+        verify: bool,
+    ) -> None:
         req_headers = {"User-Agent": _UA}
         if job.referer:
             req_headers["Referer"] = job.referer
@@ -398,6 +428,7 @@ class DownloadManager:
             follow_redirects=True,
             timeout=httpx.Timeout(60.0, read=300.0),
             headers=req_headers,
+            verify=verify,
         ) as client:
             try:
                 total, ranges_ok = await self._probe(client, job.url)
